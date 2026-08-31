@@ -22,6 +22,10 @@ is not permission to deploy a duplicate body. Local Stop/Start routing is unchan
   runtime-only negative control, then authored Online presence.
 - `desktop/tests/e2e/profile.spec.ts`: created-agent initial Online snapshot and
   live Offline/Online transitions alongside independent Stop/Start controls.
+- `desktop/tests/e2e/onboarding.spec.ts`: Welcome kickoff stays pending after
+  runtime start alone, then greets the owner and addresses Honey/Pollen only
+  after the scenario publishes their explicit presence. Healthy-team scenarios
+  use `tests/helpers/welcomeTeam.ts`, without changing the product readiness wait.
 
 Mock create/start/stop only model runtime bookkeeping. Scenarios that require
 availability use `__BUZZ_E2E_EMIT_MOCK_PRESENCE__` to seed the snapshot and emit
