@@ -130,3 +130,22 @@ test("global search results join only while global search is enabled", () => {
   assert.equal(searched[0].displayName, "Dana");
   assert.equal(searched[0].isGlobalSearchResult, true);
 });
+
+for (const locallyManaged of [true, false]) {
+  test(`roster candidate preserves exact local management: ${locallyManaged}`, () => {
+    const [candidate] = buildMentionCandidates(
+      input({
+        members: [{ pubkey: AGENT_PUBKEY, displayName: "Scout", role: "bot" }],
+        managedAgentNamesByPubkey: new Map(
+          locallyManaged ? [[AGENT_PUBKEY, "Scout"]] : [],
+        ),
+        managedAgents: locallyManaged
+          ? [{ pubkey: AGENT_PUBKEY, name: "Scout", status: "deployed" }]
+          : [],
+        mentionableAgentPubkeys: new Set([AGENT_PUBKEY]),
+      }),
+    );
+    assert.equal(candidate.isMember, true);
+    assert.equal(Boolean(candidate.isManagedAgent), locallyManaged);
+  });
+}

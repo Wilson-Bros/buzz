@@ -200,7 +200,11 @@ with a TypeScript lookup table or an id comparison in a component.
    agent from Agents, a DM, or a channel must expose the same actions, tabs,
    fields, and profile-wide activity selection. Caller context may control the
    panel shell or return navigation, but must not filter or replace profile
-   content.
+   content. The shared cloud marker means “Not managed on this device” only
+   after ownership and successful local inventory are known. It does not imply
+   hosting location, availability, or permission. Keep all identity surfaces on
+   the shared provenance context, without per-row directory subscriptions. See
+   [the provenance contract](../../../../docs/agent-management-provenance.md).
 14. **Thinking effort has two surfaces: a local-only WRITE control and a
    read-only two-facts DISPLAY.** The write control is `EffortPickerField`
    (`ui/EffortPickerField.tsx`), a self-contained section component mounted in

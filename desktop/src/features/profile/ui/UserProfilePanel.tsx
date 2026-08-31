@@ -760,6 +760,7 @@ export function UserProfilePanel({
     {
       agentSettingsMenu,
       effectivePubkey,
+      ownerPubkey: profile?.ownerPubkey,
       logCopyValue: isDiagnosticsLikeView ? managedAgentLogContent : null,
       logSubtitle: logHeaderSubtitle,
       onBack: () => setView("summary"),
