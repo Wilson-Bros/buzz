@@ -7,6 +7,10 @@ import {
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
+import {
+  agentPresenceStartBlockReason,
+  useAgentAvailability,
+} from "@/features/agents/lib/useAgentAvailability";
 import { clearActiveTurnsForAgentOnStop } from "@/features/agents/managedAgentRuntimeHooks";
 import type { Channel, ManagedAgent, RelayAgent } from "@/shared/api/types";
 
@@ -23,6 +27,7 @@ export function useAgentLifecycleActions({
   startManagedAgent: (pubkey: string) => Promise<unknown>;
   stopManagedAgent: (pubkey: string) => Promise<unknown>;
 }) {
+  const { status: availability } = useAgentAvailability(managedAgent?.pubkey);
   const handleAgentPrimaryAction = React.useCallback(async () => {
     if (!managedAgent) return;
 
@@ -41,6 +46,8 @@ export function useAgentLifecycleActions({
         return;
       }
 
+      const blockReason = agentPresenceStartBlockReason(false, availability);
+      if (blockReason) throw new Error(blockReason);
       await startManagedAgentWithRules({
         agent: managedAgent,
         startManagedAgent,
@@ -56,6 +63,7 @@ export function useAgentLifecycleActions({
       );
     }
   }, [
+    availability,
     channels,
     managedAgent,
     relayAgents,
@@ -67,6 +75,11 @@ export function useAgentLifecycleActions({
     if (!managedAgent) return;
 
     try {
+      const blockReason = agentPresenceStartBlockReason(
+        isManagedAgentActive(managedAgent),
+        availability,
+      );
+      if (blockReason) throw new Error(blockReason);
       await respawnManagedAgentWithRules({
         agent: managedAgent,
         startManagedAgent,
@@ -79,7 +92,7 @@ export function useAgentLifecycleActions({
         error instanceof Error ? error.message : "Agent restart failed.",
       );
     }
-  }, [managedAgent, startManagedAgent, stopManagedAgent]);
+  }, [availability, managedAgent, startManagedAgent, stopManagedAgent]);
 
   return { handleAgentPrimaryAction, handleAgentRestart };
 }

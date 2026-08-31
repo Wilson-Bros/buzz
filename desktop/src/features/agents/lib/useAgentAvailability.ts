@@ -14,6 +14,19 @@ export function resolveAgentAvailability(
   return presenceLoaded && connected ? (status ?? "offline") : undefined;
 }
 
+/** Positive presence blocks another start, but never grants lifecycle control.
+ * Missing/offline presence is not proof that starting another body is safe.
+ */
+export function agentPresenceStartBlockReason(
+  isLifecycleActive: boolean,
+  availability: PresenceStatus | undefined,
+): string | undefined {
+  return !isLifecycleActive &&
+    (availability === "online" || availability === "away")
+    ? "This agent is present on the relay. Starting another instance is unavailable."
+    : undefined;
+}
+
 /** Share the existing presence query/subscription; no separate status cache. */
 export function useAgentAvailability(pubkey: string | null | undefined) {
   const query = usePresenceQuery(pubkey ? [pubkey] : []);

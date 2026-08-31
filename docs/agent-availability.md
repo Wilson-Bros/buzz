@@ -12,12 +12,31 @@ remain separate: a deployed provider agent still offers Shutdown while offline.
 Shutdown sends a request, not a confirmed termination, and absence of presence
 is not permission to deploy a duplicate body. Local Stop/Start routing is unchanged.
 
+A locally stopped record with current exact-key Online or Away presence does
+not establish local process ownership. Its card replaces Start (including a
+stale restart/error badge) with the presence dot; its profile and member menu
+retain the lifecycle-derived Start label but disable activation with an
+explanation. No Stop is invented. Local/pair-owned running controls keep their
+existing Stop/Restart routing, even when presence is Offline. The same positive
+presence guard covers list/profile callbacks and member bulk respawn so the
+visible affordance is not the only fence. This is a UI startup guard, **not** a
+distributed singleton lock: missing, expired, failed or disconnected presence
+cannot certify that starting another body is safe. Existing relay query/live
+subscription freshness remains authoritative; no separate heartbeat or cache
+is introduced. Runtime details remain accessible through the card/profile.
+
+
 ## Regression evidence
 
 - `desktop/src/features/agents/lib/useAgentAvailability.test.mjs`: successful,
   missing, unavailable, and disconnected presence; lifecycle routing and badges.
 - `desktop/tests/e2e/agent-availability.spec.ts`: deployed/offline profile and
-  card, live presence and disconnected-state behavior.
+  card, stopped/Online and Away presence, disabled keyboard/click Start in
+  profile and member menu, restored Offline startup, running-but-Offline,
+  live updates and disconnected-state behavior.
+- `desktop/src/features/agents/ui/UnifiedAgentsSectionCardTarget.test.mjs`:
+  mounted persona/custom/unknown cards, exact-key versus other-key presence,
+  Online/Away/offline/missing transitions and actual Start callback activation.
 - `desktop/tests/e2e/agents.spec.ts`: Start badge animation and avatar continuity,
   runtime-only negative control, then authored Online presence.
 - `desktop/tests/e2e/profile.spec.ts`: created-agent initial Online snapshot and

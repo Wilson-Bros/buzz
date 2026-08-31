@@ -14,6 +14,7 @@ import {
 import type { PresenceStatus } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { Spinner } from "@/shared/ui/spinner";
+import { agentPresenceStartBlockReason } from "../lib/useAgentAvailability";
 import { IdentityInitialsAvatar } from "./IdentityInitialsAvatar";
 
 type AgentRuntimeAvatarControlProps = {
@@ -162,7 +163,14 @@ export function AgentRuntimeAvatarControl({
   const availabilityLabel = availability
     ? getPresenceLabel(availability)
     : "Availability unknown";
-  const showStatusDot = isActive && !isRestartAction;
+  const startBlockReason = agentPresenceStartBlockReason(
+    isActive,
+    availability,
+  );
+  // A present identity need not be a process this supervisor owns. Replace
+  // Start (even a stale Restart/error badge) without inventing Stop authority.
+  const showStatusDot =
+    Boolean(startBlockReason) || (isActive && !isRestartAction);
   const hasError = !isActive && !isPending && Boolean(errorLabel);
   const errorActionLabel = `${label} has a runtime error. Open runtime details.`;
   const transition = shouldReduceMotion ? { duration: 0 } : MASK_TRANSITION;
@@ -187,7 +195,7 @@ export function AgentRuntimeAvatarControl({
               className="h-full w-full rounded-full"
               data-testid={activeTestId}
               role="img"
-              title={`${label}: ${availabilityLabel}`}
+              title={startBlockReason ?? `${label}: ${availabilityLabel}`}
             />
           ) : (
             <button

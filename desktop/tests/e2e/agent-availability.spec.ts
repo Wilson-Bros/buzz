@@ -189,3 +189,162 @@ test("missing snapshot is offline but failed reads cannot reuse cached online", 
     ).toHaveAttribute("aria-label", "Stop");
   }
 });
+
+test("stopped local with authored presence has a dot, not an invokable Start", async ({
+  page,
+}, testInfo) => {
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: LOCAL,
+        name: "Present local",
+        status: "stopped",
+        channelNames: ["agents"],
+      },
+    ],
+  });
+  await page.goto("/#/agents");
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+          channelName: "agents",
+          kind: 20001,
+        }),
+      ),
+    )
+    .toBe(true);
+  await page.evaluate(
+    (pubkey) =>
+      window.__BUZZ_E2E_EMIT_MOCK_PRESENCE__?.({ pubkey, status: "online" }),
+    LOCAL,
+  );
+  await expect(
+    page.getByTestId(`agent-runtime-active-${LOCAL}`),
+  ).toHaveAttribute("aria-label", "Present local: Online");
+  await expect(page.getByTestId(`agent-runtime-start-${LOCAL}`)).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Present local agent profile" })
+    .press("Enter");
+  const action = page.getByTestId("user-profile-agent-primary-action");
+  await expect(action).toHaveAttribute("aria-label", "Start agent");
+  await expect(action).toBeDisabled();
+  await action.evaluate((button: HTMLButtonElement) => button.click());
+  await action.press("Enter");
+  await action.press("Space");
+  expect(
+    await page.evaluate(() =>
+      (window.__BUZZ_E2E_COMMANDS__ ?? []).filter((command) =>
+        ["start_managed_agent", "stop_managed_agent"].includes(command),
+      ),
+    ),
+  ).toEqual([]);
+  await expect(page.getByTestId("user-profile-agent-restart")).toHaveCount(0);
+  const badge = page.getByTestId("user-profile-presence-badge");
+  await expect(badge).toHaveAttribute("aria-label", "Online");
+  await waitForAnimations(page);
+  await page
+    .getByTestId(`managed-agent-${LOCAL}`)
+    .screenshot({ path: testInfo.outputPath("stopped-online-card.png") });
+  await page
+    .getByTestId("user-profile-panel")
+    .screenshot({ path: testInfo.outputPath("stopped-online-profile.png") });
+  for (const status of ["away", "offline"] as const) {
+    await page.evaluate(
+      ({ pubkey, status }) =>
+        window.__BUZZ_E2E_EMIT_MOCK_PRESENCE__?.({ pubkey, status }),
+      { pubkey: LOCAL, status },
+    );
+    await expect(badge).toHaveAttribute(
+      "aria-label",
+      status === "away" ? "Away" : "Offline",
+    );
+    if (status === "away") {
+      await expect(
+        page.getByTestId(`agent-runtime-active-${LOCAL}`),
+      ).toHaveAttribute("aria-label", "Present local: Away");
+      await expect(action).toBeDisabled();
+    } else {
+      await expect(action).toBeEnabled();
+      await expect(
+        page.getByTestId(`agent-runtime-start-${LOCAL}`),
+      ).toBeVisible();
+    }
+  }
+  // Keyboard activation is restored for the ordinary stopped/offline control.
+  // Runtime startup alone must still not manufacture authored availability.
+  await action.press("Enter");
+  await expect(action).toHaveAttribute("aria-label", "Stop");
+  await expect(badge).toHaveAttribute("aria-label", "Offline");
+  await expect(
+    page.getByTestId(`agent-runtime-active-${LOCAL}`),
+  ).toHaveAttribute("aria-label", "Present local: Offline");
+});
+
+test("member menu cannot start a present stopped local runtime", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: LOCAL,
+        name: "Present member",
+        status: "stopped",
+        channelNames: ["agents"],
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-agents").click();
+  await page.getByTestId("channel-members-trigger").click();
+  const row = page.getByTestId(`sidebar-member-${LOCAL}`);
+  await expect(row).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+          channelName: "agents",
+          kind: 20001,
+        }),
+      ),
+    )
+    .toBe(true);
+  await page.evaluate(
+    (pubkey) =>
+      window.__BUZZ_E2E_EMIT_MOCK_PRESENCE__?.({ pubkey, status: "away" }),
+    LOCAL,
+  );
+  await row.hover();
+  const menu = page.getByTestId(`sidebar-member-menu-${LOCAL}`);
+  await menu.focus();
+  await menu.press("Enter");
+  const action = page.getByTestId(`sidebar-agent-action-${LOCAL}`);
+  await expect(action).toContainText("Start");
+  await expect(action).toHaveAttribute("aria-disabled", "true");
+  await action.press("Enter");
+  await action.evaluate((node: HTMLElement) => node.click());
+  expect(
+    await page.evaluate(() =>
+      (window.__BUZZ_E2E_COMMANDS__ ?? []).filter((command) =>
+        /^(start|stop)_managed_agent/.test(command),
+      ),
+    ),
+  ).toEqual([]);
+  await page.evaluate(
+    (pubkey) =>
+      window.__BUZZ_E2E_EMIT_MOCK_PRESENCE__?.({ pubkey, status: "offline" }),
+    LOCAL,
+  );
+  await expect(action).not.toHaveAttribute("aria-disabled", "true");
+  await action.click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMANDS__ ?? []).filter(
+            (command) => command === "start_managed_agent_runtime",
+          ).length,
+      ),
+    )
+    .toBe(1);
+});

@@ -89,7 +89,31 @@ for (const lifecycle of ["running", "stopped"]) {
         onStart() {},
       }),
     );
-    assert.equal(html.includes('data-testid="start"'), !isActive);
-    assert.equal(html.includes('data-testid="active"'), isActive);
+    assert.equal(html.includes('data-testid="start"'), false);
+    assert.equal(html.includes('data-testid="active"'), true);
+  });
+}
+
+for (const availability of ["online", "away"]) {
+  test(`stale restart and runtime error cannot hide stopped ${availability} presence`, () => {
+    const html = renderToStaticMarkup(
+      createElement(AgentRuntimeAvatarControl, {
+        activeTestId: "active",
+        startTestId: "start",
+        errorTestId: "error",
+        isActive: false,
+        isStarting: false,
+        requiresRestart: true,
+        errorLabel: "Previous startup failed",
+        availability,
+        label: "Agent",
+        onStart() {},
+      }),
+    );
+    assert.match(html, /data-testid="active"/);
+    assert.doesNotMatch(
+      html,
+      /data-testid="start"|data-testid="error"|<button/,
+    );
   });
 }

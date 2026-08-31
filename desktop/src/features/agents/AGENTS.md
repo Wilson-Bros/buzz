@@ -202,7 +202,10 @@ with a TypeScript lookup table or an id comparison in a component.
    panel shell or return navigation, but must not filter or replace profile
    content. Availability dots read relay presence, never a saved deployment
    receipt or runtime status. Failed/disconnected reads are unknown; lifecycle
-   actions retain their separate routing. See
+   actions retain their separate routing. Current exact-key Online/Away presence
+   suppresses Start for an inactive local record without granting Stop authority;
+   list/profile/member startup guards must not interpret Offline as proof of safe
+   startup. See
    [the availability contract](../../../../docs/agent-availability.md).
 14. **Thinking effort has two surfaces: a local-only WRITE control and a
    read-only two-facts DISPLAY.** The write control is `EffortPickerField`

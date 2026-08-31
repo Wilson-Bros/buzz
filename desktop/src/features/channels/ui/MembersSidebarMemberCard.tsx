@@ -1,4 +1,8 @@
 import {
+  agentPresenceStartBlockReason,
+  useAgentAvailability,
+} from "@/features/agents/lib/useAgentAvailability";
+import {
   Activity,
   Ban,
   Bot,
@@ -347,6 +351,14 @@ function MemberActionsMenu({
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
 
+  const { status: availability } = useAgentAvailability(managedAgent?.pubkey);
+  const startBlockReason = managedAgent
+    ? agentPresenceStartBlockReason(
+        pairAction ? pairAction === "stop" : isManagedAgentActive(managedAgent),
+        availability,
+      )
+    : undefined;
+
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
@@ -376,8 +388,11 @@ function MemberActionsMenu({
             {canViewActivity ? <DropdownMenuSeparator /> : null}
             <DropdownMenuItem
               data-testid={`sidebar-agent-action-${member.pubkey}`}
-              disabled={disabled}
-              onClick={() => onManagedAgentAction(managedAgent)}
+              disabled={disabled || Boolean(startBlockReason)}
+              title={startBlockReason}
+              onClick={() => {
+                if (!startBlockReason) onManagedAgentAction(managedAgent);
+              }}
             >
               {pairAction
                 ? getPairActionIcon(pairAction)

@@ -1,3 +1,10 @@
+import {
+  agentPresenceStartBlockReason,
+  resolveAgentAvailability,
+} from "@/features/agents/lib/useAgentAvailability";
+import { usePresenceQuery } from "@/features/presence/hooks";
+import { useRelayConnection } from "@/shared/api/useRelayConnection";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -56,6 +63,24 @@ export function useMembersSidebarActions({
   relayUrl,
 }: UseMembersSidebarActionsOptions) {
   const queryClient = useQueryClient();
+  const presenceQuery = usePresenceQuery(
+    controllableManagedBots.map((agent) => agent.pubkey),
+  );
+  const connection = useRelayConnection();
+  function assertStartNotBlockedByPresence(
+    agent: ManagedAgent,
+    lifecycleActive: boolean,
+  ) {
+    const reason = agentPresenceStartBlockReason(
+      lifecycleActive,
+      resolveAgentAvailability(
+        presenceQuery.data?.[normalizePubkey(agent.pubkey)],
+        presenceQuery.isSuccess,
+        connection === "connected",
+      ),
+    );
+    if (reason) throw new Error(reason);
+  }
   const removeMemberMutation = useRemoveChannelMemberMutation(channelId);
   const startManagedAgentMutation = useStartManagedAgentMutation();
   const stopManagedAgentMutation = useStopManagedAgentMutation();
@@ -155,6 +180,7 @@ export function useMembersSidebarActions({
       // agent-wide deploy/!shutdown flow below.
       if (agent.backend.type === "local" && relayUrl) {
         const action = managedAgentPairAction(runtime);
+        assertStartNotBlockedByPresence(agent, action === "stop");
         await runtimeActionMutation.mutateAsync({
           action,
           pubkey: agent.pubkey,
@@ -188,6 +214,7 @@ export function useMembersSidebarActions({
         return;
       }
 
+      assertStartNotBlockedByPresence(agent, false);
       await startManagedAgentWithRules({
         agent,
         startManagedAgent: startManagedAgentMutation.mutateAsync,
@@ -205,6 +232,7 @@ export function useMembersSidebarActions({
   async function handleRespawnAll() {
     await runBulkAgentAction({
       action: async (agent) => {
+        assertStartNotBlockedByPresence(agent, isManagedAgentActive(agent));
         await respawnManagedAgentWithRules({
           agent,
           startManagedAgent: startManagedAgentMutation.mutateAsync,

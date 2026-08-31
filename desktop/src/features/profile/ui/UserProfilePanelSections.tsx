@@ -2,7 +2,11 @@ import * as React from "react";
 import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
 
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
-import { getManagedAgentPrimaryActionLabel } from "@/features/agents/lib/managedAgentControlActions";
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
+import {
+  getManagedAgentPrimaryActionLabel,
+  isManagedAgentActive,
+} from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
 import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
 import type { IdentityArchiveActions } from "@/features/identity-archive/hooks";
@@ -417,6 +421,14 @@ export function ProfileSummaryView({
           concealed={primaryActionsConcealed}
           followMutation={followMutation}
           agentActionDisabled={isAgentActionPending}
+          agentStartBlockReason={
+            managedAgent
+              ? agentPresenceStartBlockReason(
+                  isManagedAgentActive(managedAgent),
+                  presenceStatus,
+                )
+              : undefined
+          }
           agentActionLabel={
             isOwner === true && managedAgent
               ? getManagedAgentPrimaryActionLabel(managedAgent)

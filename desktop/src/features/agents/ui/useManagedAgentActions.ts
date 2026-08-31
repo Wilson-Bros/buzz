@@ -14,6 +14,11 @@ import {
   useStopManagedAgentMutation,
   useDeleteManagedAgentMutation,
 } from "@/features/agents/hooks";
+import {
+  agentPresenceStartBlockReason,
+  resolveAgentAvailability,
+} from "../lib/useAgentAvailability";
+import { useRelayConnection } from "@/shared/api/useRelayConnection";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { invalidateChannelMembersRosters } from "@/features/channels/rosterFreshness";
@@ -102,6 +107,19 @@ export function useManagedAgentActions() {
   );
 
   const managedPresenceQuery = usePresenceQuery(managedPubkeyList);
+  const relayConnection = useRelayConnection();
+
+  function assertStartNotBlockedByPresence(agent: ManagedAgent) {
+    const reason = agentPresenceStartBlockReason(
+      isManagedAgentActive(agent),
+      resolveAgentAvailability(
+        managedPresenceQuery.data?.[normalizePubkey(agent.pubkey)],
+        managedPresenceQuery.isSuccess,
+        relayConnection === "connected",
+      ),
+    );
+    if (reason) throw new Error(reason);
+  }
 
   const channelsByPubkey = React.useMemo(() => {
     const map: Record<string, { id: string; name: string }[]> = {};
@@ -164,6 +182,7 @@ export function useManagedAgentActions() {
     try {
       const agent = managedAgents.find((c) => c.pubkey === pubkey);
       if (!agent) return;
+      assertStartNotBlockedByPresence(agent);
       await startManagedAgentWithRules({
         agent,
         startManagedAgent: startMutation.mutateAsync,
@@ -184,6 +203,7 @@ export function useManagedAgentActions() {
         (candidate) => candidate.pubkey === pubkey,
       );
       if (!agent) return;
+      assertStartNotBlockedByPresence(agent);
       await respawnManagedAgentWithRules({
         agent,
         startManagedAgent: startMutation.mutateAsync,

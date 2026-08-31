@@ -293,3 +293,89 @@ test("errored avatar affordance still opens the explicit pubkey on the runtime t
 
   assert.deepEqual(opened, [{ pubkey: LIVE_PK, options: { tab: "runtime" } }]);
 });
+
+for (const kind of ["persona", "custom", "unknown"]) {
+  test(`${kind} stopped card uses exact-key presence without inventing lifecycle controls`, async () => {
+    installFailOpenIpc();
+    const { relayClient } = await import("../../../shared/api/relayClient.ts");
+    const originalConnection = relayClient.getConnectionState;
+    const originalSubscribe = relayClient.subscribeToConnectionState;
+    relayClient.getConnectionState = () => "connected";
+    relayClient.subscribeToConnectionState = () => () => {};
+    let snapshot = { [ARCHIVED_PK]: "online" };
+    ipcHandlers.set("get_presence", () => Promise.resolve(snapshot));
+    const starts = [];
+    const props = baseProps({
+      agents: [
+        agent({
+          personaId:
+            kind === "custom"
+              ? null
+              : kind === "unknown"
+                ? "missing"
+                : "persona-1",
+        }),
+      ],
+      personas: kind === "persona" ? [persona()] : [],
+      onStartAgent: (key) => starts.push(key),
+      onRestartAgent: () => {
+        throw new Error("presence must not cause Restart");
+      },
+    });
+    try {
+      await act(async () => renderSection(props));
+      const client = clients.at(-1);
+      const refresh = async () => {
+        await act(async () => {
+          await client.invalidateQueries({ queryKey: ["presence"] });
+        });
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        });
+      };
+      await refresh();
+      // Different-key Online must not suppress this identity's ordinary Start.
+      fireEvent.click(screen.getByTestId(`agent-runtime-start-${LIVE_PK}`));
+      assert.deepEqual(starts, [LIVE_PK]);
+      starts.length = 0;
+      for (const status of ["online", "away", "offline", "online"]) {
+        snapshot = { [LIVE_PK]: status };
+        await refresh();
+        const start = screen.queryByTestId(`agent-runtime-start-${LIVE_PK}`);
+        if (status === "offline") {
+          assert.ok(start);
+          fireEvent.click(start);
+          assert.deepEqual(starts, [LIVE_PK]);
+          starts.length = 0;
+        } else {
+          assert.equal(
+            Boolean(start),
+            false,
+            "active exact-key presence must remove Start",
+          );
+          const dot = screen.getByTestId(`agent-runtime-active-${LIVE_PK}`);
+          assert.match(
+            dot.getAttribute("aria-label"),
+            new RegExp(status === "online" ? "Online$" : "Away$"),
+          );
+          fireEvent.click(dot);
+          fireEvent.keyDown(dot, { key: "Enter" });
+          fireEvent.keyDown(dot, { key: " " });
+          assert.deepEqual(starts, []);
+          assert.equal(
+            Boolean(screen.queryByRole("button", { name: /Stop/ })),
+            false,
+          );
+        }
+      }
+      // A successful omitted entry is the existing relay expiry/missing path.
+      snapshot = {};
+      await refresh();
+      fireEvent.click(screen.getByTestId(`agent-runtime-start-${LIVE_PK}`));
+      assert.deepEqual(starts, [LIVE_PK]);
+    } finally {
+      relayClient.getConnectionState = originalConnection;
+      relayClient.subscribeToConnectionState = originalSubscribe;
+    }
+  });
+}
