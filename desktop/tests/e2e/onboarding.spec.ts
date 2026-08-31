@@ -435,6 +435,9 @@ async function expectWelcomeView(page: Page) {
     "Create an agent",
   );
   await expect(page.getByTestId("message-composer")).toBeVisible();
+  // Measure the empty-channel intro before presence releases the live kickoff.
+  // Its message arrival can remount the timeline while bounding boxes are read.
+  await publishWelcomeTeamPresence(page);
   await expect(page.getByTestId("welcome-composer-guide-banner")).toBeVisible();
   await expect(page.getByTestId("welcome-composer-guide-banner")).toContainText(
     "Mention",
@@ -2997,7 +3000,6 @@ test("avatar step accepts an avatar URL before completing onboarding", async ({
 
   await page.getByTestId("onboarding-next").click();
   await expect(page.getByTestId("onboarding-gate")).toHaveCount(0);
-  await publishWelcomeTeamPresence(page);
   await expectWelcomeView(page);
 });
 
@@ -3033,7 +3035,6 @@ test("failed avatar saves can continue without saving the avatar", async ({
   await page.getByTestId("onboarding-next-without-saving").click();
 
   await expect(page.getByTestId("onboarding-gate")).toHaveCount(0);
-  await publishWelcomeTeamPresence(page);
   await expectWelcomeView(page);
 });
 
@@ -3132,7 +3133,6 @@ test("first-run onboarding keeps the shell hidden and lands on private Welcome a
   await page.getByTestId("onboarding-display-name").fill("Alice");
   await completeProfileOnboarding(page);
   await expect(page.getByTestId("onboarding-gate")).toHaveCount(0);
-  await publishWelcomeTeamPresence(page);
   await expectWelcomeView(page);
   await expectStarterChannels(page);
   await expectWelcomeGuideIntro(page);
@@ -3307,7 +3307,6 @@ test("finishing onboarding creates starter channels and focuses welcome-everyone
   await page.getByTestId("onboarding-display-name").fill("Morty QA");
   await completeProfileOnboarding(page);
 
-  await publishWelcomeTeamPresence(page);
   await expectWelcomeView(page);
   await expect(page.getByTestId("channel-general")).toBeVisible();
   await expectStarterChannels(page);
