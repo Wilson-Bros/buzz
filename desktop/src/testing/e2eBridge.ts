@@ -1230,6 +1230,11 @@ declare global {
       ownerPubkey: string;
       kind: number;
     }) => boolean;
+    /** Explicit presence evidence; independent of managed-agent runtime state. */
+    __BUZZ_E2E_EMIT_MOCK_PRESENCE__?: (input: {
+      pubkey: string;
+      status: PresenceStatus;
+    }) => void;
     __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
       channelName: string;
       content: string;
@@ -9640,7 +9645,7 @@ async function handleStartManagedAgent(
   agent.updated_at = now;
   agent.last_started_at = now;
   agent.last_error = null;
-  setMockPresenceStatus(agent.pubkey, "online");
+  // Lifecycle is not presence; scenarios publish explicit relay evidence.
   agent.log_lines.push(
     agent.backend.type === "provider"
       ? `deployed mock provider harness at ${now}`
@@ -9668,7 +9673,7 @@ async function handleStopManagedAgent(args: {
       row.pid = null;
     }
   }
-  setMockPresenceStatus(agent.pubkey, "offline");
+  // A stop result alone is not an authored offline presence event.
   agent.log_lines.push(`stopped mock harness at ${now}`);
   syncMockRelayAgentsFromManagedAgents();
   return cloneManagedAgent(agent);
@@ -11436,6 +11441,11 @@ export function maybeInstallE2eTauriMocks() {
     ownerPubkey,
     kind,
   }) => hasMockOwnerKindSubscription(ownerPubkey, kind);
+  window.__BUZZ_E2E_EMIT_MOCK_PRESENCE__ = ({ pubkey, status }) => {
+    const author = pubkey.toLowerCase();
+    setMockPresenceStatus(author, status);
+    emitMockGlobalEvent(createMockEvent(20001, status, [], author));
+  };
   window.__BUZZ_E2E_REPLACE_MOCK_TEAM_CATALOG_HEAD__ = (event) => {
     const dTag = event.tags.find((tag) => tag[0] === "d")?.[1];
     const existingIndex = mockTeamCatalogEvents.findIndex(

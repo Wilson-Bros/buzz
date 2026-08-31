@@ -38,7 +38,7 @@ import {
 } from "@/features/agents/ui/personaDialogState";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { useIdentityArchive } from "@/features/identity-archive/hooks";
-import { usePresenceQuery } from "@/features/presence/hooks";
+import { useAgentAvailability } from "@/features/agents/lib/useAgentAvailability";
 import {
   useContactListQuery,
   useFollowMutation,
@@ -252,9 +252,8 @@ export function UserProfilePanel({
     effectivePubkey ? [effectivePubkey] : [],
   );
   const channelsQuery = useChannelsQuery();
-  const presenceQuery = usePresenceQuery(
-    effectivePubkey ? [effectivePubkey] : [],
-  );
+  const { query: presenceQuery, status: presenceStatus } =
+    useAgentAvailability(effectivePubkey);
   const userStatusQuery = useUserStatusQuery(
     effectivePubkey ? [effectivePubkey] : [],
   );
@@ -270,9 +269,6 @@ export function UserProfilePanel({
   });
   const ownerPubkey = profile?.ownerPubkey ?? null;
   const ownerProfileQuery = useUserProfileQuery(ownerPubkey ?? undefined);
-  const presenceStatus = pubkeyLower
-    ? presenceQuery.data?.[pubkeyLower]
-    : undefined;
   const userStatus = pubkeyLower
     ? userStatusQuery.data?.[pubkeyLower]
     : undefined;

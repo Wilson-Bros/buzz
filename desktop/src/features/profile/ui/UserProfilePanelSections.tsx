@@ -2,10 +2,7 @@ import * as React from "react";
 import { ChevronDown, ChevronUp, Pencil } from "lucide-react";
 
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
-import {
-  getManagedAgentPrimaryActionLabel,
-  isManagedAgentActive,
-} from "@/features/agents/lib/managedAgentControlActions";
+import { getManagedAgentPrimaryActionLabel } from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
 import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
 import type { IdentityArchiveActions } from "@/features/identity-archive/hooks";
@@ -189,13 +186,6 @@ export function ProfileSummaryView({
   userStatus,
 }: ProfileSummaryViewProps) {
   const activeTurns = useAgentWorking(isBot ? pubkey : null).channels;
-  const avatarStatus = isBot
-    ? managedAgent
-      ? isManagedAgentActive(managedAgent)
-        ? "online"
-        : "offline"
-      : (presenceStatus ?? "offline")
-    : presenceStatus;
   const stickyLayoutRef = React.useRef<HTMLDivElement>(null);
   const [primaryActionsConcealed, setPrimaryActionsConcealed] =
     React.useState(false);
@@ -406,7 +396,7 @@ export function ProfileSummaryView({
           displayName={displayName}
           isBot={isBot}
           onEditAgent={canEditAgent ? handleEditAgent : undefined}
-          presenceStatus={avatarStatus}
+          presenceStatus={presenceStatus}
           profile={profile}
           userStatus={userStatus}
         />
