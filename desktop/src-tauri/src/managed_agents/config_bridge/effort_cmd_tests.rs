@@ -8,7 +8,9 @@
 //! (`runtime.rs`), the same function `spawn_agent_child` calls. Deleting
 //! `apply_spawn_effort_env` from that wrapper turns these tests RED.
 //! Deleting the `apply_effort_to_spawn_command` call from `spawn_agent_child`
-//! is a compile error (the returned `EffortApplied` sentinel is required).
+//! is a compile error: `spawn_with_effort_proof` consumes the returned
+//! `EffortApplied` by value, so removing the binding leaves `effort` undefined
+//! at the spawn site.
 
 use std::collections::BTreeMap;
 
@@ -175,7 +177,7 @@ fn production_sequence_goose_inherited_collision_resolved_in_child() {
 
     let mut r = record();
     r.effort_level = Some("high".into());
-    apply_effort_to_spawn_command(
+    let _effort = apply_effort_to_spawn_command(
         &mut cmd,
         &r,
         Some(goose()),
@@ -227,7 +229,7 @@ fn production_sequence_arbitrary_mixedcase_collision_absent_from_child_windows()
     cmd.env(mixed, "stale-mixed");
     let mut r = record();
     r.effort_level = Some("high".into());
-    apply_effort_to_spawn_command(
+    let _effort = apply_effort_to_spawn_command(
         &mut cmd,
         &r,
         Some(goose()),
@@ -259,7 +261,7 @@ fn production_sequence_custom_passthrough_survives() {
     cmd.env_clear();
     cmd.env("MY_HARNESS_EFFORT", "high");
     cmd.env("MY_UNRELATED_CONFIG", "keep");
-    apply_effort_to_spawn_command(
+    let _effort = apply_effort_to_spawn_command(
         &mut cmd,
         &record(),
         None,
@@ -287,7 +289,7 @@ fn production_sequence_custom_inherited_goose_key_survives() {
     let _lock = crate::managed_agents::lock_env_mutex();
     let _guard = EnvVarGuard::set(GOOSE_KEY, "inherited-high");
     let mut cmd = std::process::Command::new("/usr/bin/env");
-    apply_effort_to_spawn_command(
+    let _effort = apply_effort_to_spawn_command(
         &mut cmd,
         &record(),
         None,
@@ -310,7 +312,7 @@ fn production_sequence_custom_inherited_acp_sentinel_survives() {
     let _lock = crate::managed_agents::lock_env_mutex();
     let _guard = EnvVarGuard::set(ACP_KEY, "inherited-val");
     let mut cmd = std::process::Command::new("/usr/bin/env");
-    apply_effort_to_spawn_command(
+    let _effort = apply_effort_to_spawn_command(
         &mut cmd,
         &record(),
         None,
@@ -335,7 +337,7 @@ fn production_sequence_custom_passthrough_survives() {
     cmd.env_clear();
     cmd.env("MY_HARNESS_EFFORT", "high");
     cmd.env("MY_UNRELATED_CONFIG", "keep");
-    apply_effort_to_spawn_command(
+    let _effort = apply_effort_to_spawn_command(
         &mut cmd,
         &record(),
         None,

@@ -479,11 +479,12 @@ fn resolve_effective_effort(
 
 /// Combined spawn seam: baked-env write + effort strip + emit.
 ///
-/// Both `runtime.rs` (`spawn_agent_child`) and the production-sequence tests call
-/// this function, so deleting `build_buzz_agent_provider_defaults` or
-/// `apply_effort_launch_to_command` inside is caught by the tests. The outer
-/// invocation from `spawn_agent_child` is not unit-testable without Tauri
-/// infrastructure and is therefore not covered at this level.
+/// Called by `apply_effort_to_spawn_command` in `runtime.rs` (production path)
+/// and by `effort_cmd_tests` (test seam). Deleting `build_buzz_agent_provider_defaults`
+/// or `apply_effort_launch_to_command` inside turns the production-sequence tests RED.
+/// Deleting the outer `apply_effort_to_spawn_command` call from `spawn_agent_child`
+/// is a compile error — `spawn_with_effort_proof` consumes the returned `EffortApplied`
+/// token, so removing the binding leaves `effort` undefined at the spawn site.
 pub(crate) fn apply_spawn_effort_env(
     cmd: &mut std::process::Command,
     record: &ManagedAgentRecord,

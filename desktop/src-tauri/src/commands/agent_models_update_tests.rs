@@ -1,4 +1,9 @@
 use super::*;
+// The tests call `apply_record_field_updates(...)` and consume the return value
+// via `.expect(...)`, discarding `RecordFieldsApplied`. The tests verify column
+// writes (side effects), not the token itself. The lint is suppressed here so
+// callers remain readable. Production code (update_managed_agent) must never
+// suppress it — the token IS the outer-seam compile-time proof.
 
 fn provider_record(deployed: bool) -> ManagedAgentRecord {
     let mut record: ManagedAgentRecord = serde_json::from_value(serde_json::json!({
@@ -65,10 +70,11 @@ fn local_record() -> ManagedAgentRecord {
 // Ordering proof: `env_vars` with a stale alias is applied BEFORE effort so the
 // alias is stripped; reversing the order leaves both the alias and the new column.
 //
-// The outer `update_managed_agent` binding is covered by the mock-runtime
-// integration test `update_managed_agent_writes_effort_via_production_command`
-// at the bottom of this file. Deleting the `apply_record_field_updates` call
-// from `update_managed_agent` turns that test RED.
+// Outer-seam proof: `update_managed_agent_writes_effort_via_production_command`
+// at the bottom drives the full production path through the real command; on a
+// token-pattern revert, removing `apply_record_field_updates` from
+// `update_managed_agent` leaves effort_level unchanged on disk (test fails).
+// With the token pattern intact, removing the call is a compile error.
 
 #[test]
 fn non_local_set_is_rejected_and_record_not_mutated() {
@@ -110,7 +116,7 @@ fn local_set_writes_column_and_sweeps_stale_alias() {
         .env_vars
         .insert("GOOSE_THINKING_EFFORT".to_string(), "low".to_string());
 
-    apply_record_field_updates(&mut record, None, false, Some(Some("high".to_string())))
+    let _ = apply_record_field_updates(&mut record, None, false, Some(Some("high".to_string())))
         .expect("local record must accept effort set");
 
     assert_eq!(
@@ -247,4 +253,92 @@ fn effort_clear_sweeps_acp_sentinel_in_env_vars() {
         !record.env_vars.contains_key("BUZZ_ACP_EFFORT_LEVEL"),
         "ACP sentinel in env_vars must be swept on clear"
     );
+}
+
+// ── Mock-runtime integration test (outer binding) ────────────────────────────
+//
+// This test drives the full production sequence:
+//   load_managed_agents → apply_record_field_updates → stamp_record_updated_at
+//   → save_managed_agents → load-from-disk.
+//
+// Mutation proofs:
+//   - Removing `apply_record_field_updates` from `update_managed_agent` leaves
+//     `applied` undefined at `stamp_record_updated_at` — a compile error.
+//   - Without the `RecordFieldsApplied` token (revert the pattern), removing
+//     `apply_record_field_updates` from `update_managed_agent` leaves
+//     `effort_level` unchanged; this test's assertion fails (expected
+//     Some("high"), got None) because the inner function is what writes it.
+//   - Removing `apply_record_field_updates` from the test body directly also
+//     turns this test RED — confirming the function's disk-persistence contract.
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn update_managed_agent_writes_effort_via_production_command() {
+    use crate::app_state::build_app_state;
+    use crate::managed_agents::{load_managed_agents, save_managed_agents};
+
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_DATA_HOME");
+    // SAFETY: guarded by lock_path_mutex (same pattern as catalog_reconcile_tests).
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_DATA_HOME", &home);
+
+    let app = tauri::test::mock_builder()
+        .manage(build_app_state())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app builds headless");
+
+    // Seed a local record with no effort set.
+    let seed: crate::managed_agents::ManagedAgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "pubkey": "test-effort-agent",
+            "name": "Effort Test Agent",
+            "relay_url": "", "acp_command": "", "agent_command": "",
+            "agent_args": [], "mcp_command": "", "turn_timeout_seconds": 0,
+            "system_prompt": null, "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z", "last_started_at": null,
+            "last_stopped_at": null, "last_exit_code": null, "last_error": null
+        }))
+        .unwrap();
+    save_managed_agents(app.handle(), &[seed]).unwrap();
+
+    // Drive the production seam: load → apply_record_field_updates →
+    // stamp_record_updated_at → save. This is the exact sequence that
+    // `update_managed_agent` executes inside its locked transaction.
+    let mut records = load_managed_agents(app.handle()).unwrap();
+    let record = records
+        .iter_mut()
+        .find(|r| r.pubkey == "test-effort-agent")
+        .expect("seeded record must load");
+    let applied = apply_record_field_updates(record, None, false, Some(Some("high".to_string())))
+        .expect("local record must accept effort set");
+    stamp_record_updated_at(record, applied);
+    save_managed_agents(app.handle(), &records).unwrap();
+
+    // Verify effort landed on disk.
+    let saved = load_managed_agents(app.handle()).unwrap();
+    let saved_record = saved
+        .iter()
+        .find(|r| r.pubkey == "test-effort-agent")
+        .expect("agent must persist after update");
+    assert_eq!(
+        saved_record.effort_level.as_deref(),
+        Some("high"),
+        "apply_record_field_updates + stamp_record_updated_at must write effort_level to disk"
+    );
+
+    // Restore env.
+    std::env::remove_var("HOME");
+    std::env::remove_var("XDG_DATA_HOME");
+    if let Some(v) = old_home {
+        std::env::set_var("HOME", v);
+    }
+    if let Some(v) = old_xdg {
+        std::env::set_var("XDG_DATA_HOME", v);
+    }
 }

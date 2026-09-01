@@ -64,9 +64,21 @@ fn apply_effort_update(
     Ok(())
 }
 
+/// Proof token returned by `apply_record_field_updates`. Zero-size and
+/// `#[must_use]`; consumed by `stamp_record_updated_at`, so removing the
+/// `apply_record_field_updates` call from `update_managed_agent` leaves
+/// `applied` undefined at the timestamp site — a compile error.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct RecordFieldsApplied(());
+
 /// Apply the env-vars and effort steps of `update_managed_agent` to a record
 /// in the correct order: env_vars FIRST (so the same-request map cannot
 /// reintroduce a stale alias), then the canonical effort column write.
+///
+/// Returns a `RecordFieldsApplied` token that must be passed to
+/// `stamp_record_updated_at`. Removing this call from `update_managed_agent`
+/// leaves `applied` undefined at the timestamp site — a compile error.
 ///
 /// Called by `update_managed_agent` inside its locked transaction and by tests.
 /// Any step deleted from inside this function is directly caught by the
@@ -83,7 +95,7 @@ pub(crate) fn apply_record_field_updates(
     env_vars: Option<&std::collections::BTreeMap<String, String>>,
     inherit_transition: bool,
     effort_level: Option<Option<String>>,
-) -> Result<(), String> {
+) -> Result<RecordFieldsApplied, String> {
     // Order is load-bearing: env_vars before effort so a same-request
     // env_vars map cannot reintroduce a stale alias after the column write.
     crate::managed_agents::apply_env_vars_then_effort_transition(
@@ -92,7 +104,17 @@ pub(crate) fn apply_record_field_updates(
         inherit_transition,
     );
     apply_effort_update(record, effort_level)?;
-    Ok(())
+    Ok(RecordFieldsApplied(()))
+}
+
+/// Stamp `record.updated_at` with the current ISO timestamp, consuming the
+/// `RecordFieldsApplied` proof token. Removing `apply_record_field_updates`
+/// from `update_managed_agent` leaves `applied` undefined here — a compile error.
+pub(crate) fn stamp_record_updated_at(
+    record: &mut ManagedAgentRecord,
+    _applied: RecordFieldsApplied,
+) {
+    record.updated_at = crate::util::now_iso();
 }
 
 /// Flush a retained managed-agent policy, preserving any earlier profile error.
@@ -286,14 +308,18 @@ pub async fn update_managed_agent(
         // locked transaction so an access-policy restart above snapshots and
         // launches the new effort value. Present+Some(v)=set; Present+None=clear;
         // Absent=don't touch (the dialog sends it only when effortTouched).
-        apply_record_field_updates(
+        // The returned token is consumed by `stamp_record_updated_at`; removing
+        // this call from `update_managed_agent` leaves `applied` undefined there
+        // — a compile error that `update_managed_agent_writes_effort_via_production_command`
+        // also turns RED on a correctly-compiled tree.
+        let applied = apply_record_field_updates(
             record,
             input.env_vars.as_ref(),
             inherit_transition,
             input.effort_level,
         )?;
 
-        record.updated_at = now_iso();
+        stamp_record_updated_at(record, applied);
 
         save_managed_agents(&app, &records)?;
 
@@ -447,5 +473,6 @@ pub async fn update_managed_agent(
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 #[path = "agent_models_update_tests.rs"]
 mod tests;

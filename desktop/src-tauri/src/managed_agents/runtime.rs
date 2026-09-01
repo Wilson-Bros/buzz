@@ -388,15 +388,18 @@ pub(crate) fn configure_runtime_cli(
     }
 }
 
-/// Proof token for the effort-application outer binding. Zero-size; makes
-/// `let _effort = apply_effort_to_spawn_command(…)` a compile-time
-/// requirement — the call cannot be silently removed from `spawn_agent_child`.
+/// Proof token for the effort-application outer binding. Zero-size and
+/// `#[must_use]`; makes `let effort = apply_effort_to_spawn_command(…)` a
+/// compile-time requirement — deleting the binding is a compile error because
+/// `spawn_with_effort_proof` consumes it by value.
+#[must_use]
 pub(crate) struct EffortApplied;
 
-/// Apply effort env to an agent spawn command (production path: `spawn_agent_child`;
-/// test path: `effort_cmd_tests`). Inner-seam: removing `apply_spawn_effort_env`
-/// below turns the production-sequence tests RED. Outer-seam: removing this call
-/// from `spawn_agent_child` is a compile error (EffortApplied binding required).
+/// Apply effort env to an agent spawn command. Called by `spawn_agent_child`
+/// (production) and `effort_cmd_tests` (test seam). Inner-seam: removing
+/// `apply_spawn_effort_env` below turns the production-sequence tests RED.
+/// Outer-seam: the returned token is consumed by `spawn_with_effort_proof`;
+/// deleting this call leaves `effort` undefined at the spawn site.
 pub(crate) fn apply_effort_to_spawn_command(
     cmd: &mut std::process::Command,
     record: &crate::managed_agents::types::ManagedAgentRecord,
@@ -410,6 +413,16 @@ pub(crate) fn apply_effort_to_spawn_command(
         cmd, record, runtime, personas, persona_id, global_env, baked_env,
     );
     EffortApplied
+}
+
+/// Spawn the agent command, consuming the `EffortApplied` proof token.
+/// Deleting `apply_effort_to_spawn_command` from `spawn_agent_child` leaves
+/// `effort` undefined here — a compile error CI catches before any test runs.
+pub(crate) fn spawn_with_effort_proof(
+    cmd: &mut std::process::Command,
+    _effort: EffortApplied,
+) -> std::io::Result<std::process::Child> {
+    cmd.spawn()
 }
 
 /// Spawn an agent process without holding any locks on records or runtimes.
@@ -750,8 +763,9 @@ pub fn spawn_agent_child(
         resolve_session_title(record.display_name.as_deref(), &record.name),
     );
     // Strip all known effort keys and emit exactly one projected key. Command
-    // inherits the parent env — `EffortApplied` makes this a compile requirement.
-    let _effort = apply_effort_to_spawn_command(
+    // inherits the parent env — the returned EffortApplied token is consumed
+    // by spawn_with_effort_proof below; deleting this call is a compile error.
+    let effort = apply_effort_to_spawn_command(
         &mut command,
         record,
         runtime_meta,
@@ -891,7 +905,7 @@ pub fn spawn_agent_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = command.spawn().map_err(|error| {
+    let child = spawn_with_effort_proof(&mut command, effort).map_err(|error| {
         format!(
             "failed to spawn `{}` for agent {}: {error}",
             resolved_acp_command.display(),
