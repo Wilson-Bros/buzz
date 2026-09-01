@@ -310,8 +310,7 @@ pub async fn update_managed_agent(
         // Absent=don't touch (the dialog sends it only when effortTouched).
         // The returned token is consumed by `stamp_record_updated_at`; removing
         // this call from `update_managed_agent` leaves `applied` undefined there
-        // — a compile error that `update_managed_agent_writes_effort_via_production_command`
-        // also turns RED on a correctly-compiled tree.
+        // — a compile error (the sole outer-seam proof for this call site).
         let applied = apply_record_field_updates(
             record,
             input.env_vars.as_ref(),

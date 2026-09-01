@@ -70,11 +70,12 @@ fn local_record() -> ManagedAgentRecord {
 // Ordering proof: `env_vars` with a stale alias is applied BEFORE effort so the
 // alias is stripped; reversing the order leaves both the alias and the new column.
 //
-// Outer-seam proof: `update_managed_agent_writes_effort_via_production_command`
-// at the bottom drives the full production path through the real command; on a
-// token-pattern revert, removing `apply_record_field_updates` from
-// `update_managed_agent` leaves effort_level unchanged on disk (test fails).
-// With the token pattern intact, removing the call is a compile error.
+// Outer-seam proof (compile-error): removing `apply_record_field_updates` from
+// `update_managed_agent` leaves `applied` undefined at `stamp_record_updated_at`
+// — a compile error enforced by the `#[must_use] RecordFieldsApplied` token.
+// `update_managed_agent_writes_effort_via_production_command` below proves the
+// disk-persistence contract of `apply_record_field_updates` itself (calls it
+// directly); it does not independently gate the production invocation.
 
 #[test]
 fn non_local_set_is_rejected_and_record_not_mutated() {
@@ -255,21 +256,22 @@ fn effort_clear_sweeps_acp_sentinel_in_env_vars() {
     );
 }
 
-// ── Mock-runtime integration test (outer binding) ────────────────────────────
+// ── Mock-runtime integration test (disk-persistence contract) ────────────────
 //
-// This test drives the full production sequence:
+// This test drives the production function sequence directly in its own body:
 //   load_managed_agents → apply_record_field_updates → stamp_record_updated_at
 //   → save_managed_agents → load-from-disk.
 //
-// Mutation proofs:
-//   - Removing `apply_record_field_updates` from `update_managed_agent` leaves
+// Mutation proofs (scoped to this test body):
+//   - Removing `apply_record_field_updates` from this test body leaves
 //     `applied` undefined at `stamp_record_updated_at` — a compile error.
-//   - Without the `RecordFieldsApplied` token (revert the pattern), removing
-//     `apply_record_field_updates` from `update_managed_agent` leaves
-//     `effort_level` unchanged; this test's assertion fails (expected
-//     Some("high"), got None) because the inner function is what writes it.
-//   - Removing `apply_record_field_updates` from the test body directly also
-//     turns this test RED — confirming the function's disk-persistence contract.
+//   - Removing the function call and stubbing the token manually leaves
+//     `effort_level` unchanged on disk — assertion fails (expected
+//     Some("high"), got None).
+//
+// What this test does NOT prove: it does not gate the production invocation
+// inside `update_managed_agent`. That is gated solely by the compile error
+// described in the outer-seam comment above (undefined `applied` token).
 
 #[cfg(not(target_os = "windows"))]
 #[test]
