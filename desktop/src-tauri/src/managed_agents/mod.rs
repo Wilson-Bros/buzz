@@ -57,6 +57,17 @@ pub(crate) fn lock_path_mutex() -> std::sync::MutexGuard<'static, ()> {
     PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// Shared guard for tests that mutate process-global environment variables.
+// Tests in different modules that touch the same env keys (e.g. GOOSE_THINKING_EFFORT,
+// BUZZ_ACP_EFFORT_LEVEL) must hold this lock for the duration of the mutation + spawn.
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_env_mutex() -> std::sync::MutexGuard<'static, ()> {
+    ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub use backend::*;
 pub(crate) use definition_validation::{
     validate_agent_definition_text, validate_agent_description_text,

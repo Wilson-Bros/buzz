@@ -240,20 +240,11 @@ pub(crate) fn effort_suppress_keys() -> Vec<&'static str> {
 /// Strip every known effort key from a [`std::process::Command`] before the
 /// descriptor overlay is written.
 ///
-/// `Command` inherits the parent process environment implicitly: an ambient
-/// `BUZZ_ACP_EFFORT_LEVEL` (e.g. exported from the shell that launched Desktop)
-/// or a raw baked-env write (`build_buzz_agent_provider_defaults`) would
-/// survive into the child even after `descriptor.env` writes the correct
-/// projected key, leaving two active effort authorities. buzz-acp reads the
-/// surviving sentinel and applies it via `session/set_config_option` at session
-/// creation, so the user's selected effort loses to the ambient value.
-///
-/// Strips the full [`effort_suppress_keys`] set (canonical upper-snake-case
-/// and lowercase variant) from the `Command`. The descriptor overlay that
-/// follows immediately emits the single correct projected key.
-///
-/// Called in `runtime.rs` after `build_buzz_agent_provider_defaults` (raw
-/// baked env) and before the `descriptor.env` loop (projected key).
+/// Only used in tests to verify tombstone assertions on individual keys.
+/// Production stripping runs inside `apply_effort_launch_to_command`
+/// (the loop over `launch.suppress`) which is exercised by the
+/// production-sequence tests.
+#[cfg(test)]
 pub(crate) fn strip_effort_keys_from_command(cmd: &mut std::process::Command) {
     for key in effort_suppress_keys() {
         cmd.env_remove(key);

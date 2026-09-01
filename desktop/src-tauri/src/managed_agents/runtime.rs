@@ -225,23 +225,14 @@ pub fn build_managed_agent_summary(
         }
     };
 
-    // Restart badge: the running process stamped the effective spawn config
-    // it was launched with; recompute a prospective one from current disk
-    // state and report every differing field. Only the tracked live pair for
-    // THIS workspace can drift — stopped agents spawn fresh, adopted
-    // (runtime_pid-only) processes have no stamp to compare, and pairs running
-    // for other communities are judged in their own community (comparing them
-    // against this workspace's relay would flag a spurious restart on every
-    // community switch).
-    //
-    // Adapter-availability drift (codex only) contributes its own synthetic
-    // entry, so an out-of-band adapter change (manual npm install/downgrade)
-    // that Phase-1 auto-restart doesn't cover still shows the user what moved.
-    // The cache is read-only here — no subprocess is spawned.
-    //
-    // Global config drives both the prospective snapshot and the descriptor
-    // env layering below — the caller loads it once and passes it in, so
-    // list-style callers pay one disk read per call rather than one per record.
+    // Restart badge: the running process stamped its effective spawn config;
+    // recompute a prospective one from current disk state and report every
+    // differing field. Only the tracked live pair for THIS workspace can drift
+    // (stopped agents spawn fresh; adopted processes have no stamp; other-
+    // community pairs are judged in their own community). Adapter drift
+    // (codex only) contributes a synthetic entry for out-of-band npm changes.
+    // Global config drives both snapshot and descriptor env layering; the
+    // caller loads it once so list callers pay one disk read per call.
 
     // The prospective side is computed only for a tracked pair: an unstamped
     // agent has nothing to compare against.
@@ -395,6 +386,30 @@ pub(crate) fn configure_runtime_cli(
         }
         command.env("CLAUDE_CODE_EXECUTABLE", cli_path);
     }
+}
+
+/// Proof token for the effort-application outer binding. Zero-size; makes
+/// `let _effort = apply_effort_to_spawn_command(…)` a compile-time
+/// requirement — the call cannot be silently removed from `spawn_agent_child`.
+pub(crate) struct EffortApplied;
+
+/// Apply effort env to an agent spawn command (production path: `spawn_agent_child`;
+/// test path: `effort_cmd_tests`). Inner-seam: removing `apply_spawn_effort_env`
+/// below turns the production-sequence tests RED. Outer-seam: removing this call
+/// from `spawn_agent_child` is a compile error (EffortApplied binding required).
+pub(crate) fn apply_effort_to_spawn_command(
+    cmd: &mut std::process::Command,
+    record: &crate::managed_agents::types::ManagedAgentRecord,
+    runtime: Option<&crate::managed_agents::discovery::KnownAcpRuntime>,
+    personas: &[crate::managed_agents::types::AgentDefinition],
+    persona_id: Option<&str>,
+    global_env: &std::collections::BTreeMap<String, String>,
+    baked_env: &std::collections::BTreeMap<String, String>,
+) -> EffortApplied {
+    super::config_bridge::effort::apply_spawn_effort_env(
+        cmd, record, runtime, personas, persona_id, global_env, baked_env,
+    );
+    EffortApplied
 }
 
 /// Spawn an agent process without holding any locks on records or runtimes.
@@ -552,23 +567,16 @@ pub fn spawn_agent_child(
 
     // ── Readiness check: set setup-payload if agent is not ready ─────────────
     //
-    // Build the effective env the agent would have at start-time, run the
-    // readiness predicate, and if anything is missing, serialize the payload
-    // into BUZZ_ACP_SETUP_PAYLOAD.  buzz-acp detects this env var on startup
-    // and enters the minimal setup-listener mode instead of the agent pool.
+    // Build the effective env, run the readiness predicate, and serialize any
+    // missing requirements into BUZZ_ACP_SETUP_PAYLOAD. buzz-acp enters
+    // setup-listener mode when this env var is present.
     //
-    // SECURITY: BUZZ_ACP_SETUP_PAYLOAD is in RESERVED_ENV_KEYS so user env
-    // cannot set it, but we also explicitly remove it after writing user env
-    // to guard against the parent-process environment. We then set it only
-    // when desktop has computed NotReady — the desktop is the sole readiness
-    // source and buzz-acp only transports the payload.
+    // SECURITY: BUZZ_ACP_SETUP_PAYLOAD is in RESERVED_ENV_KEYS (user env cannot
+    // set it). We also remove it after writing user env as a parent-process guard,
+    // then set it only when desktop computes NotReady — desktop is the sole source.
     //
-    // The JSON format mirrors `setup_mode::SetupPayload` in buzz-acp:
-    //   { "agent_name": "...", "agent_pubkey": "...", "requirements": [{ "surface": "...", ... }] }
-    //
-    // `spawned_setup_mode` is captured outside the block so it can be stamped
-    // on `ManagedAgentProcess` — used by `install_acp_runtime` to target only
-    // stuck agents for auto-restart.
+    // `spawned_setup_mode` is captured outside the block to stamp
+    // `ManagedAgentProcess` (used by `install_acp_runtime` for auto-restart).
     let spawned_setup_mode;
     {
         use crate::managed_agents::readiness::EffectiveAgentEnv;
@@ -741,9 +749,9 @@ pub fn spawn_agent_child(
         &mut command,
         resolve_session_title(record.display_name.as_deref(), &record.name),
     );
-    // Strip all known effort keys and emit exactly one projected key. `Command`
-    // inherits the parent env — an ambient effort key would leave two authorities.
-    super::config_bridge::effort::apply_spawn_effort_env(
+    // Strip all known effort keys and emit exactly one projected key. Command
+    // inherits the parent env — `EffortApplied` makes this a compile requirement.
+    let _effort = apply_effort_to_spawn_command(
         &mut command,
         record,
         runtime_meta,

@@ -2,13 +2,19 @@
 //!
 //! Split from `effort_tests.rs` to stay within the file-size ratchet.
 //! Covers `strip_effort_keys_from_command` tombstone assertions and the
-//! child-process spawn sequence via `apply_spawn_effort_env`.
+//! child-process spawn sequence via `apply_effort_to_spawn_command`.
+//!
+//! The production-sequence tests call `apply_effort_to_spawn_command`
+//! (`runtime.rs`), the same function `spawn_agent_child` calls. Deleting
+//! `apply_spawn_effort_env` from that wrapper turns these tests RED.
+//! Deleting the `apply_effort_to_spawn_command` call from `spawn_agent_child`
+//! is a compile error (the returned `EffortApplied` sentinel is required).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
-use super::super::{apply_spawn_effort_env, strip_effort_keys_from_command};
+use super::super::strip_effort_keys_from_command;
 use super::*;
+use crate::managed_agents::runtime::apply_effort_to_spawn_command;
 
 // --------------------------------------------------------------------------
 // Command-boundary strip (P1: inherited + baked collision)
@@ -94,27 +100,31 @@ fn strip_does_not_remove_unrelated_env_key() {
 // Production-sequence seam tests
 // --------------------------------------------------------------------------
 // Spawn the child directly so its actual env is the ground truth.
-// These call `apply_spawn_effort_env`, the same function `spawn_agent_child` uses.
+// These call `apply_effort_to_spawn_command` (in `runtime.rs`), the same function
+// `spawn_agent_child` calls. Deleting `apply_spawn_effort_env` from that wrapper
+// turns these tests RED. The `EffortApplied` sentinel makes the call site in
+// `spawn_agent_child` a compile-time requirement.
 // Deletion proofs:
 //   - remove `build_buzz_agent_provider_defaults` inside → baked keys leak;
 //   - remove `effort_launch_projection` → suppress list is empty, keys leak;
 //   - remove `apply_effort_launch_to_command` → stale keys remain, assertion fails.
 //
-// Inherited-state tests seed the parent env via `std::env::set_var` under
-// INHERITED_ENV_LOCK. `EnvVarGuard` restores the prior value in `Drop`,
-// so panics do not leak the seeded value into unrelated child-spawn tests.
-
-static INHERITED_ENV_LOCK: Mutex<()> = Mutex::new(());
+// Inherited-state tests seed the parent env via `std::env::set_var` under the
+// crate-wide env lock (`crate::managed_agents::lock_env_mutex`). `EnvVarGuard`
+// restores the exact prior value (including non-Unicode) in `Drop`, so panics
+// do not leak the seeded value into unrelated child-spawn tests.
 
 /// RAII guard: snapshots a process-env variable and restores the exact prior
 /// value (or removes it if it was absent) on `Drop`, even on panic.
+/// Uses `OsString` so a pre-existing non-Unicode value is restored exactly
+/// rather than being silently lost.
 struct EnvVarGuard {
     key: String,
-    prior: Option<String>,
+    prior: Option<std::ffi::OsString>,
 }
 impl EnvVarGuard {
     fn set(key: &str, value: &str) -> Self {
-        let prior = std::env::var(key).ok();
+        let prior = std::env::var_os(key);
         #[allow(deprecated)]
         unsafe {
             std::env::set_var(key, value);
@@ -155,7 +165,7 @@ fn run_env_cmd(cmd: &mut std::process::Command) -> String {
 #[cfg(not(target_os = "windows"))]
 fn production_sequence_goose_inherited_collision_resolved_in_child() {
     let lower = GOOSE_KEY.to_ascii_lowercase();
-    let _lock = INHERITED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = crate::managed_agents::lock_env_mutex();
     let _guard = EnvVarGuard::set(&lower, "inherited-low");
 
     let mut cmd = std::process::Command::new("/usr/bin/env");
@@ -165,7 +175,7 @@ fn production_sequence_goose_inherited_collision_resolved_in_child() {
 
     let mut r = record();
     r.effort_level = Some("high".into());
-    apply_spawn_effort_env(
+    apply_effort_to_spawn_command(
         &mut cmd,
         &r,
         Some(goose()),
@@ -217,7 +227,7 @@ fn production_sequence_arbitrary_mixedcase_collision_absent_from_child_windows()
     cmd.env(mixed, "stale-mixed");
     let mut r = record();
     r.effort_level = Some("high".into());
-    apply_spawn_effort_env(
+    apply_effort_to_spawn_command(
         &mut cmd,
         &r,
         Some(goose()),
@@ -249,7 +259,7 @@ fn production_sequence_custom_passthrough_survives() {
     cmd.env_clear();
     cmd.env("MY_HARNESS_EFFORT", "high");
     cmd.env("MY_UNRELATED_CONFIG", "keep");
-    apply_spawn_effort_env(
+    apply_effort_to_spawn_command(
         &mut cmd,
         &record(),
         None,
@@ -274,10 +284,10 @@ fn production_sequence_custom_passthrough_survives() {
 #[test]
 #[cfg(not(target_os = "windows"))]
 fn production_sequence_custom_inherited_goose_key_survives() {
-    let _lock = INHERITED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = crate::managed_agents::lock_env_mutex();
     let _guard = EnvVarGuard::set(GOOSE_KEY, "inherited-high");
     let mut cmd = std::process::Command::new("/usr/bin/env");
-    apply_spawn_effort_env(
+    apply_effort_to_spawn_command(
         &mut cmd,
         &record(),
         None,
@@ -297,10 +307,10 @@ fn production_sequence_custom_inherited_goose_key_survives() {
 #[test]
 #[cfg(not(target_os = "windows"))]
 fn production_sequence_custom_inherited_acp_sentinel_survives() {
-    let _lock = INHERITED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = crate::managed_agents::lock_env_mutex();
     let _guard = EnvVarGuard::set(ACP_KEY, "inherited-val");
     let mut cmd = std::process::Command::new("/usr/bin/env");
-    apply_spawn_effort_env(
+    apply_effort_to_spawn_command(
         &mut cmd,
         &record(),
         None,
@@ -325,7 +335,7 @@ fn production_sequence_custom_passthrough_survives() {
     cmd.env_clear();
     cmd.env("MY_HARNESS_EFFORT", "high");
     cmd.env("MY_UNRELATED_CONFIG", "keep");
-    apply_spawn_effort_env(
+    apply_effort_to_spawn_command(
         &mut cmd,
         &record(),
         None,

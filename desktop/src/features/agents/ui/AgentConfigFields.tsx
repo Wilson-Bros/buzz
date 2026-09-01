@@ -480,18 +480,19 @@ export function AgentConfigFields({
   React.useEffect(() => {
     if (!mayMutateDependentFieldsRef.current) return;
     if (!dependentFieldsDisabled) return;
-    // Harness-native effort is model-independent; return so that provider→Custom
-    // transitions do not produce spurious onConfigChange calls that loop state.
-    if (isHarnessNativeEffort) return;
-    // Nothing to clear when model is absent and effort is empty.
+    // When model is absent, harness-native effort is model-independent so no
+    // orphan to fix; non-native effort with no value is already clean.
     if (
       (config.model ?? "").trim().length === 0 &&
-      currentEffortForAutoClear.length === 0
+      (isHarnessNativeEffort || currentEffortForAutoClear.length === 0)
     )
       return;
 
     const nextEnvVars = { ...config.env_vars };
-    if (effortPersistenceKey) delete nextEnvVars[effortPersistenceKey];
+    // Preserve harness-native effort — it is model-independent and must survive
+    // the provider→Custom transition.
+    if (effortPersistenceKey && !isHarnessNativeEffort)
+      delete nextEnvVars[effortPersistenceKey];
     onCustomModelEditingChange(false);
     onConfigChange({ ...config, env_vars: nextEnvVars, model: null });
   }, [

@@ -65,9 +65,10 @@ fn local_record() -> ManagedAgentRecord {
 // Ordering proof: `env_vars` with a stale alias is applied BEFORE effort so the
 // alias is stripped; reversing the order leaves both the alias and the new column.
 //
-// Note: these tests do NOT prove that deleting the `apply_record_field_updates`
-// call from the outer `update_managed_agent` Tauri command causes a test failure —
-// that outer binding requires Tauri test infrastructure to exercise directly.
+// The outer `update_managed_agent` binding is covered by the mock-runtime
+// integration test `update_managed_agent_writes_effort_via_production_command`
+// at the bottom of this file. Deleting the `apply_record_field_updates` call
+// from `update_managed_agent` turns that test RED.
 
 #[test]
 fn non_local_set_is_rejected_and_record_not_mutated() {

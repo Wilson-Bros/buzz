@@ -17,9 +17,10 @@
  *     removes it from effortValidForRenderer → same failure.
  *   - Revert humanizeEffortLabel → the trigger textContent shows "off" not "Off"
  *     → the visible-label assertion turns RED.
- *   - Remove the provider-empty termination guard (isHarnessNativeEffort in the
- *     auto-clear useEffect early-return) → the Save/reread test produces repeated
- *     onConfigChange calls instead of converging → write-count assertion fails.
+ *   - Remove the provider-empty termination guard (isHarnessNativeEffort &&
+ *     model===null in the auto-clear useEffect early-return) → the provider-empty
+ *     test produces repeated onConfigChange calls instead of converging → write-
+ *     count assertion fails.
  */
 
 import assert from "node:assert/strict";
@@ -256,10 +257,11 @@ test("AgentConfigFields (useCustomSelect): Goose off renders 'Off' in custom tri
 });
 
 test("AgentConfigFields: provider-empty onboarding with Goose effort is a stable fixed point (no loop)", async () => {
-  // Regression for Carl P2: provider-empty mount with harness-native effort must
-  // NOT loop. The isHarnessNativeEffort early-return in the cleanup effect makes
-  // this a no-op — without it the effect fires on every config update, producing
-  // unbounded onConfigChange emissions.
+  // Regression for Carl P2: provider-empty mount with harness-native effort and
+  // null model must NOT loop. When both model and effort-key are absent the
+  // cleanup effect returns early (nothing to clear) — without that guard the
+  // effect would fire on every config update, producing unbounded onConfigChange
+  // emissions.
   const runtime = fromRawAcpRuntimeCatalogEntry(rawGooseCatalogEntry());
   const configChanges = [];
   render(
@@ -293,10 +295,13 @@ test("AgentConfigFields: provider-empty onboarding with Goose effort is a stable
 });
 
 test("AgentConfigFields: provider→Custom switch with Goose effort converges (no loop)", async () => {
-  // Regression for Carl P2 (Defaults surface): after the user selects Custom
-  // provider, isHarnessNativeEffort terminates the cleanup effect immediately,
-  // preserving Goose effort and producing at most one onConfigChange callback.
-  // Without the fix the effect fires on every re-render and the callback loops.
+  // Regression for provider→Custom switch (Defaults surface): the cleanup
+  // effect must converge after the user selects Custom provider.  With
+  // `disclosure:"full"` `mayMutateDependentFieldsRef` is false until the user
+  // edits the provider, so the orphan-model effect is a no-op here; the
+  // convergence property is that `onConfigChange` is not called in a loop.
+  // Separately, Goose effort must be preserved because the effort key is
+  // never deleted when `isHarnessNativeEffort` is true.
   const runtime = fromRawAcpRuntimeCatalogEntry(rawGooseCatalogEntry());
   const configChanges = [];
   let currentConfig = {
@@ -359,6 +364,69 @@ test("AgentConfigFields: provider→Custom switch with Goose effort converges (n
     lastConfig.env_vars?.GOOSE_THINKING_EFFORT,
     "off",
     "Goose effort must be preserved after provider→Custom switch",
+  );
+});
+
+test("AgentConfigFields: provider→Custom with stale Anthropic model clears model but preserves Goose effort (Carl P2 fix)", async () => {
+  // Regression for Carl P2 (model cleanup): a Goose session on anthropic+model
+  // that switches to Custom provider must clear the stale Anthropic model via
+  // the orphan-model cleanup effect, while preserving the harness-native
+  // GOOSE_THINKING_EFFORT value.
+  //
+  // Before the fix: `if (isHarnessNativeEffort) return` exited before clearing
+  // model — the stale model was submitted on Save with the new provider.
+  // After the fix: the guard only short-circuits when model is already null;
+  // a non-null model is cleared once and effort is left intact.
+  //
+  // Mutation proof: revert the `isHarnessNativeEffort &&` guard change (restore
+  // `if (isHarnessNativeEffort) return`) → the effect returns before clearing
+  // model → this test's model===null assertion fails.
+  //
+  // Uses disclosure:"onboarding-essential" so healOnMount=true activates the
+  // cleanup effect without requiring a real UI provider-edit gesture.
+  const runtime = fromRawAcpRuntimeCatalogEntry(rawGooseCatalogEntry());
+  const configChanges = [];
+  render(
+    createElement(AgentConfigFields, {
+      bakedEnv: [],
+      selectedRuntime: runtime,
+      config: {
+        env_vars: { GOOSE_THINKING_EFFORT: "off" },
+        provider: null, // Custom: provider null, isCustomProvider=true
+        model: "claude-3-5-sonnet", // stale model from previous provider
+        preferred_runtime: "goose",
+      },
+      isCustomModelEditing: false,
+      isCustomProvider: true, // user switched to Custom
+      onConfigChange: (next) => {
+        configChanges.push(next);
+      },
+      onCustomModelEditingChange: () => {},
+      onIsCustomProviderChange: () => {},
+      disclosure: "onboarding-essential", // healOnMount=true activates cleanup
+      useCustomSelect: true,
+    }),
+  );
+  await act(async () => {});
+  // Drain a second tick — one-shot clear fires in a single effect pass.
+  await act(async () => {});
+
+  // Must emit exactly one onConfigChange: the stale-model clear.
+  assert.equal(
+    configChanges.length,
+    1,
+    `expected exactly 1 onConfigChange (stale-model clear); got ${configChanges.length}`,
+  );
+  const cleared = configChanges[0];
+  assert.equal(
+    cleared.model,
+    null,
+    "stale Anthropic model must be cleared to null after Custom switch",
+  );
+  assert.equal(
+    cleared.env_vars?.GOOSE_THINKING_EFFORT,
+    "off",
+    "Goose effort must be preserved (not cleared) during orphan-model fix",
   );
 });
 
