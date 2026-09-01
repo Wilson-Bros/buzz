@@ -854,7 +854,13 @@ pub async fn claim_due_match_batch(
         lease_until,
         |pool, community, ids| async move {
             let refs: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
-            crate::event::get_events_by_ids(&pool, community, &refs).await
+            crate::event::get_events_by_ids_with_operation(
+                &pool,
+                community,
+                &refs,
+                crate::observability::WriterOperation::Maintenance,
+            )
+            .await
         },
     )
     .await

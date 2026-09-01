@@ -79,3 +79,376 @@ fn relay_admin_db_wrappers_have_exactly_one_datastore_span() {
         );
     }
 }
+
+#[test]
+fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
+    let observability = include_str!("../src/runtime/observability.rs");
+    assert!(observability.contains("enum PoolOperation"));
+    assert!(observability.contains("pub(crate) enum WriterOperation"));
+    assert!(observability.contains("pub(crate) enum ReaderOperation"));
+    assert!(observability.contains("Self::WriterAuthentication"));
+    assert!(observability.contains("Self::ReaderSubscriptionHistory"));
+    assert!(observability.contains("pub(crate) async fn acquire_writer("));
+    assert!(observability.contains("pub(super) async fn acquire_reader("));
+    assert!(observability.contains("static POOL_WAITERS: [Mutex<u64>"));
+    assert!(!observability.contains("AtomicU64"));
+    assert!(!observability.contains("DbOperation::Other"));
+    assert!(!observability.contains("\"other\""));
+    assert!(!observability.contains("buzz_db_pool_acquire_timeouts_total"));
+    assert!(!observability.contains("\"result\" =>"));
+
+    let runtime = include_str!("../src/runtime/mod.rs");
+    assert!(runtime.contains("observability::acquire_writer_until("));
+    assert!(runtime.contains("WriterOperation::Readiness"));
+    assert!(runtime.contains("WriterOperation::EventWrite"));
+    assert!(runtime.contains("ReaderOperation::Bootstrap"));
+    assert!(runtime.contains("pub async fn begin_event_write_transaction"));
+
+    let allowlist = include_str!("../src/store/allowlist.rs");
+    assert!(allowlist.contains("WriterOperation::Authentication"));
+    assert!(allowlist.contains("WriterOperation::Authorization"));
+    assert!(!allowlist.contains("fetch_one(&self.pool)"));
+
+    let event = include_str!("../src/store/event.rs");
+    assert!(event.contains("query_events_with_operation"));
+    assert!(event.contains("WriterOperation::Authorization"));
+    assert!(event.contains("WriterOperation::SubscriptionHistory"));
+    assert!(event.contains("ReaderOperation::SubscriptionHistory"));
+    let backfill_d_tags = event
+        .split_once("pub async fn backfill_d_tags")
+        .expect("event store must expose the startup d-tag backfill")
+        .1
+        .split_once("/// Soft-delete NIP-29 discovery events")
+        .expect("d-tag backfill must precede discovery deletion")
+        .0;
+    assert!(backfill_d_tags.contains("WriterOperation::Bootstrap"));
+    assert!(backfill_d_tags.contains("execute(&mut *connection)"));
+    let soft_delete_discovery = event
+        .split_once("pub async fn soft_delete_discovery_events")
+        .expect("event store must expose discovery-event deletion")
+        .1
+        .split_once("\n}\n\n#[cfg(test)]")
+        .expect("discovery deletion must end the production Db implementation")
+        .0;
+    assert!(soft_delete_discovery.contains("WriterOperation::EventWrite"));
+    assert!(soft_delete_discovery.contains("execute(&mut *connection)"));
+
+    let side_effects = include_str!("../../buzz-relay/src/handlers/side_effects.rs");
+    assert!(side_effects.contains("query_events_for_event_write"));
+    assert!(side_effects.contains("query_events_for_bootstrap"));
+
+    let thread = include_str!("../src/store/thread.rs");
+    let thread_metadata = thread
+        .split_once("pub async fn get_thread_metadata_by_event(")
+        .expect("thread store must expose metadata lookup")
+        .1
+        .split_once("// -- Db API")
+        .expect("metadata lookup must precede the Db wrapper section")
+        .0;
+    assert!(thread_metadata.contains("WriterOperation::EventWrite"));
+    assert!(thread_metadata.contains("fetch_optional(&mut *connection)"));
+    assert!(!thread_metadata.contains("fetch_optional(pool)"));
+
+    let channel = include_str!("../src/store/channel.rs");
+    let get_channel = channel
+        .split_once("async fn get_channel_with_operation(")
+        .expect("channel store must route shared lookups through caller-owned intent")
+        .1
+        .split_once("/// Returns the canvas content")
+        .expect("channel lookup helper must precede canvas reads")
+        .0;
+    assert!(get_channel.contains("acquire_writer(pool, operation)"));
+    assert!(get_channel.contains("fetch_optional(&mut *connection)"));
+    assert!(!get_channel.contains("fetch_optional(pool)"));
+    assert!(channel.contains("pub async fn get_channel_for_event_write("));
+
+    let channel_members = include_str!("../src/store/channel_members.rs");
+    assert!(channel_members.contains("async fn get_members_with_operation("));
+    assert!(channel_members.contains("pub async fn get_members_for_event_write("));
+    assert!(channel_members.contains("async fn get_users_bulk_with_operation("));
+    assert!(channel_members.contains("pub async fn get_users_bulk_for_event_write("));
+
+    let huddle_link = event
+        .split_once("async fn huddle_started_link_exists_with_operation(")
+        .expect("huddle link lookup must accept caller-owned intent")
+        .1
+        .split_once("/// Insert a Nostr event")
+        .expect("huddle link lookup must precede event insertion")
+        .0;
+    assert!(huddle_link.contains("acquire_writer(pool, operation)"));
+    assert!(event.contains("pub async fn huddle_started_link_exists_for_event_write("));
+    let ingest = include_str!("../../buzz-relay/src/handlers/ingest.rs");
+    assert!(ingest.contains(".huddle_started_link_exists_for_event_write("));
+    let audio = include_str!("../../buzz-relay/src/audio/handler.rs");
+    assert!(audio.contains(".huddle_started_link_exists("));
+
+    let workflow_sink = include_str!("../../buzz-relay/src/workflow_sink.rs");
+    assert!(workflow_sink.contains(".get_members_for_event_write("));
+    assert!(workflow_sink.contains(".get_users_bulk_for_event_write("));
+
+    for write_caller in [
+        include_str!("../../buzz-relay/src/handlers/side_effects.rs"),
+        include_str!("../../buzz-relay/src/handlers/ingest.rs"),
+        include_str!("../../buzz-relay/src/handlers/command_executor.rs"),
+        workflow_sink,
+    ] {
+        assert!(!write_caller.contains(".get_channel("));
+        assert!(write_caller.contains(".get_channel_for_event_write("));
+    }
+
+    let user = include_str!("../src/store/user.rs");
+    let agent_channel_policy = user
+        .split_once("pub async fn get_agent_channel_policy(")
+        .expect("user store must expose get_agent_channel_policy")
+        .1
+        .split_once("/// Check whether `actor_pubkey`")
+        .expect("agent policy lookup must precede owner lookup")
+        .0;
+    assert!(agent_channel_policy.contains("WriterOperation::Authorization"));
+    assert!(agent_channel_policy.contains("fetch_optional(&mut *connection)"));
+    assert!(!agent_channel_policy.contains("fetch_optional(pool)"));
+    let is_agent_owner = user
+        .split_once("pub async fn is_agent_owner(")
+        .expect("user store must expose is_agent_owner")
+        .1
+        .split_once("/// Set the channel_add_policy")
+        .expect("is_agent_owner must precede set_agent_channel_policy")
+        .0;
+    assert!(is_agent_owner.contains("WriterOperation::Authorization"));
+    assert!(is_agent_owner.contains("acquire_writer("));
+    assert!(is_agent_owner.contains("fetch_optional(&mut *connection)"));
+    assert!(!is_agent_owner.contains("fetch_optional(pool)"));
+
+    let moderation = include_str!("../src/store/moderation.rs");
+    let restriction_state = moderation
+        .split_once("pub async fn restriction_state(")
+        .expect("moderation store must expose restriction_state")
+        .1
+        .split_once("/// Fetch the full ban/timeout row")
+        .expect("restriction state must precede full ban reads")
+        .0;
+    assert!(restriction_state.contains("WriterOperation::Authorization"));
+    assert!(restriction_state.contains("fetch_optional(&mut *connection)"));
+    assert!(!restriction_state.contains("fetch_optional(pool)"));
+
+    let community_store = include_str!("../src/store/community.rs");
+    let ensure_community = community_store
+        .split_once("pub async fn ensure_configured_community(")
+        .expect("community store must expose ensure_configured_community")
+        .1
+        .split_once("/// Atomically creates a community")
+        .expect("configured-community helpers must precede community creation")
+        .0;
+    assert!(ensure_community.contains("WriterOperation::Authorization"));
+    assert!(ensure_community.contains("WriterOperation::Bootstrap"));
+    assert!(ensure_community.contains("ensure_configured_community_with_operation"));
+    assert!(ensure_community.contains("acquire_writer(&self.pool, operation)"));
+    assert!(ensure_community.contains("fetch_optional(&mut *connection)"));
+    let management_lookup = community_store
+        .split_once("pub async fn lookup_community_by_host_for_management(")
+        .expect("community store must expose management host lookup")
+        .1
+        .split_once("/// Lists communities where")
+        .expect("management lookup must precede owner listing")
+        .0;
+    assert!(management_lookup.contains("WriterOperation::Authorization"));
+    assert!(management_lookup.contains("fetch_optional(&mut *connection)"));
+    assert!(!management_lookup.contains("fetch_optional(&self.pool)"));
+    let community_production = community_store
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("community production source");
+    for required in [
+        "WriterOperation::TenantResolution",
+        "WriterOperation::Authorization",
+        "WriterOperation::SubscriptionHistory",
+        "WriterOperation::EventWrite",
+    ] {
+        assert!(
+            community_production.contains(required),
+            "community P0 paths must include {required} attribution"
+        );
+    }
+    assert!(!community_production.contains("self.pool.begin().await"));
+    assert!(!community_production.contains(".fetch_one(&self.pool)"));
+    assert!(!community_production.contains(".fetch_all(&self.pool)"));
+    assert!(!community_production.contains(".execute(&self.pool)"));
+    assert_eq!(
+        community_production
+            .matches(".fetch_optional(&self.pool)")
+            .count(),
+        1,
+        "only the out-of-scope NIP-11 metadata read may retain a raw pool checkout"
+    );
+
+    let thread_summary = thread
+        .split_once("pub async fn get_thread_summary(")
+        .expect("thread store must expose get_thread_summary")
+        .1
+        .split_once("/// Fetch one channel window")
+        .expect("thread summary must precede channel-window reads")
+        .0;
+    assert!(thread_summary.contains("WriterOperation::EventWrite"));
+    assert!(thread_summary.contains("fetch_optional(&mut *connection)"));
+    assert!(thread_summary.contains("fetch_all(&mut *connection)"));
+    assert!(!thread_summary.contains("fetch_optional(pool)"));
+    assert!(!thread_summary.contains("fetch_all(pool)"));
+
+    let archived_identities = include_str!("../src/store/archived_identities.rs");
+    let archived_identity_production = archived_identities
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("archived identity production source");
+    assert_eq!(
+        archived_identity_production
+            .matches("WriterOperation::EventWrite")
+            .count(),
+        4,
+        "all four archived identity operations must be attributed to event writes"
+    );
+    assert!(!archived_identity_production.contains("fetch_optional(pool)"));
+    assert!(!archived_identity_production.contains("fetch_all(pool)"));
+    assert!(!archived_identity_production.contains("execute(pool)"));
+
+    let relay_main = include_str!("../../buzz-relay/src/main.rs");
+    assert!(relay_main.contains("pool_state.db.refresh_pool_waiter_metrics();"));
+    assert!(relay_main.contains(".ensure_configured_community_for_bootstrap("));
+
+    let runtime = include_str!("../src/runtime/mod.rs");
+    assert!(runtime.contains("observability::refresh_pool_waiters(self.read_pool.is_some())"));
+    assert!(runtime.contains("self.verify_replica_fence_at_boot().await?"));
+    let fence_boot = runtime
+        .split_once("pub(crate) async fn verify_replica_fence_at_boot")
+        .expect("runtime must expose attributed boot fence verification")
+        .1
+        .split_once("/// The pool for lag-tolerant reads")
+        .expect("boot fence verification must precede routed-read plumbing")
+        .0;
+    assert!(fence_boot.contains("WriterOperation::Bootstrap"));
+
+    let replica_fence = include_str!("../src/runtime/replica_fence.rs");
+    let replica_fence_production = replica_fence
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("replica-fence production source");
+    assert!(replica_fence_production.contains("WriterOperation::Bootstrap"));
+    assert!(replica_fence_production.contains("WriterOperation::Maintenance"));
+    assert!(!replica_fence_production.contains("pool.begin().await"));
+    assert!(!replica_fence_production.contains("writer.acquire().await"));
+    assert!(!replica_fence_production.contains("fetch_optional(writer)"));
+
+    let usage = include_str!("../src/store/usage.rs");
+    let usage_production = usage
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("usage production source");
+    assert!(
+        usage_production
+            .matches("WriterOperation::Maintenance")
+            .count()
+            >= 11,
+        "every periodic usage checkout must be maintenance-attributed"
+    );
+    for bypass in [
+        ".fetch_one(pool)",
+        ".fetch_all(pool)",
+        ".fetch_optional(pool)",
+        ".execute(pool)",
+    ] {
+        assert!(
+            !usage_production.contains(bypass),
+            "usage production path bypasses operation attribution with {bypass}"
+        );
+    }
+
+    let channel_reaper = channel
+        .split_once("pub async fn reap_expired_ephemeral_channels(pool:")
+        .expect("channel store must expose ephemeral reaper")
+        .1
+        .split_once("\nimpl Db {")
+        .expect("ephemeral reaper must precede Db wrappers")
+        .0;
+    assert!(channel_reaper.contains("WriterOperation::Maintenance"));
+    assert!(channel_reaper.contains("fetch_all(&mut *connection)"));
+
+    let deletion = include_str!("../src/store/deletion.rs");
+    let lease_reaper = deletion
+        .split_once("pub async fn reap_expired_serving_write_leases")
+        .expect("deletion store must expose serving-lease reaper")
+        .1
+        .split_once("/// Return serving-lease counts")
+        .expect("serving-lease reaper must precede stats")
+        .0;
+    assert!(lease_reaper.contains("WriterOperation::Maintenance"));
+    assert!(lease_reaper.contains("execute(&mut *connection)"));
+    let lease_stats = deletion
+        .split_once("pub async fn serving_lease_stats")
+        .expect("deletion store must expose serving-lease stats")
+        .1
+        .split_once("/// Whether a community remains active")
+        .expect("serving-lease stats must precede serving-state reads")
+        .0;
+    assert!(lease_stats.contains("WriterOperation::Maintenance"));
+    assert!(lease_stats.contains("fetch_one(&mut *connection)"));
+
+    let ensure_authorization = user
+        .split_once("pub async fn ensure_user_for_authorization(")
+        .expect("user store must expose NIP-OA authorization ensure")
+        .1
+        .split_once("/// Get a single user record")
+        .expect("authorization ensure must precede generic user reads")
+        .0;
+    assert!(ensure_authorization.contains("WriterOperation::Authorization"));
+    let set_owner_authorization = user
+        .split_once("pub async fn set_agent_owner_for_authorization(")
+        .expect("user store must expose NIP-OA authorization owner write")
+        .1
+        .split_once("/// Get the channel_add_policy")
+        .expect("authorization owner write must precede policy reads")
+        .0;
+    assert!(set_owner_authorization.contains("WriterOperation::Authorization"));
+    let relay_api = include_str!("../../buzz-relay/src/api/mod.rs");
+    assert!(relay_api.contains(".ensure_user_for_authorization("));
+    assert!(relay_api.contains(".set_agent_owner_for_authorization("));
+
+    for (domain, source) in [
+        (
+            "channel_members",
+            include_str!("../src/store/channel_members.rs"),
+        ),
+        ("archived_identities", archived_identities),
+        ("event", event),
+        ("git_repo", include_str!("../src/store/git_repo.rs")),
+        ("replica_fence", replica_fence),
+        ("reaction", include_str!("../src/store/reaction.rs")),
+        ("relay_invite", include_str!("../src/store/relay_invite.rs")),
+        (
+            "relay_members",
+            include_str!("../src/store/relay_members.rs"),
+        ),
+        (
+            "relay_operators",
+            include_str!("../src/store/relay_operators.rs"),
+        ),
+        ("usage", usage),
+    ] {
+        let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+        for bypass in [
+            "pool.begin().await",
+            "self.pool.begin().await",
+            ".fetch_one(pool)",
+            ".fetch_one(&self.pool)",
+            ".fetch_all(pool)",
+            ".fetch_all(&self.pool)",
+            ".fetch_optional(pool)",
+            ".fetch_optional(&self.pool)",
+            ".execute(pool)",
+            ".execute(&self.pool)",
+        ] {
+            assert!(
+                !production.contains(bypass),
+                "{domain} production path bypasses operation attribution with {bypass}"
+            );
+        }
+    }
+}

@@ -327,7 +327,12 @@ async fn redis_check(pool: &deadpool_redis::Pool, deadline: Instant) -> RedisOut
 }
 
 async fn deletion_catalog_check(db: &Db, deadline: Instant) -> DeletionCatalogOutcome {
-    match tokio::time::timeout_at(deadline, db.validate_deletion_serving_catalog()).await {
+    match tokio::time::timeout_at(
+        deadline,
+        db.validate_deletion_serving_catalog_for_readiness(deadline),
+    )
+    .await
+    {
         Err(_) => DeletionCatalogOutcome::OperationTimeout,
         Ok(Err(error)) => {
             tracing::debug!(error = %error, "Deletion catalog readiness validation failed");

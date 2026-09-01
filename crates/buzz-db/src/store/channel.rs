@@ -269,6 +269,22 @@ pub async fn get_channel(
     community_id: CommunityId,
     channel_id: Uuid,
 ) -> Result<ChannelRecord> {
+    get_channel_with_operation(
+        pool,
+        community_id,
+        channel_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await
+}
+
+async fn get_channel_with_operation(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    operation: crate::observability::WriterOperation,
+) -> Result<ChannelRecord> {
+    let mut connection = crate::observability::acquire_writer(pool, operation).await?;
     let row = sqlx::query(
         r#"
         SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility,
@@ -283,7 +299,7 @@ pub async fn get_channel(
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?
     .ok_or(DbError::ChannelNotFound(channel_id))?;
 
@@ -714,6 +730,11 @@ pub async fn soft_delete_channel(
 /// `archived_at IS NULL` guard prevents double-archiving even if called
 /// concurrently from multiple relay pods.
 pub async fn reap_expired_ephemeral_channels(pool: &PgPool) -> Result<Vec<ReapedEphemeralChannel>> {
+    let mut connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::Maintenance,
+    )
+    .await?;
     let rows = sqlx::query(
         "UPDATE channels AS ch SET archived_at = NOW() \
          FROM communities AS c \
@@ -726,7 +747,7 @@ pub async fn reap_expired_ephemeral_channels(pool: &PgPool) -> Result<Vec<Reaped
            AND community_write_allowed(ch.community_id) \
          RETURNING ch.community_id, c.host, ch.id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
 
     rows.into_iter()
@@ -808,6 +829,23 @@ impl Db {
         channel_id: Uuid,
     ) -> Result<ChannelRecord> {
         get_channel(&self.pool, community_id, channel_id).await
+    }
+
+    /// Fetch a channel whose result directly gates an event mutation or
+    /// post-commit event side effect.
+    #[datastore_span(name = "get_channel_for_event_write", system = "postgresql")]
+    pub async fn get_channel_for_event_write(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<ChannelRecord> {
+        get_channel_with_operation(
+            &self.pool,
+            community_id,
+            channel_id,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await
     }
 
     /// Returns the canvas content for a channel, if any.

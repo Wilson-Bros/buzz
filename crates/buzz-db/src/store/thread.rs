@@ -355,7 +355,11 @@ pub async fn get_thread_replies(
     limit: u32,
     cursor: Option<&[u8]>,
 ) -> Result<Vec<ThreadReply>> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::SubscriptionHistory,
+    )
+    .await?;
     get_thread_replies_on(
         &mut conn,
         community_id,
@@ -520,6 +524,11 @@ pub async fn get_thread_summary(
     community_id: CommunityId,
     event_id: &[u8],
 ) -> Result<Option<ThreadSummary>> {
+    let mut connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let row = sqlx::query(
         r#"
         SELECT reply_count, descendant_count, last_reply_at
@@ -530,7 +539,7 @@ pub async fn get_thread_summary(
     )
     .bind(community_id.as_uuid())
     .bind(event_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?;
 
     let row = match row {
@@ -563,7 +572,7 @@ pub async fn get_thread_summary(
     )
     .bind(community_id.as_uuid())
     .bind(event_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
 
     let participants: Vec<Vec<u8>> = participant_rows
@@ -599,7 +608,11 @@ pub async fn get_channel_window(
     cursor: Option<(DateTime<Utc>, Vec<u8>)>,
     kind_filter: Option<&[u32]>,
 ) -> Result<ChannelWindow> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::SubscriptionHistory,
+    )
+    .await?;
     get_channel_window_on(
         &mut conn,
         community_id,
@@ -811,6 +824,11 @@ pub async fn get_thread_metadata_by_event(
     community_id: CommunityId,
     event_id: &[u8],
 ) -> Result<Option<ThreadMetadataRecord>> {
+    let mut connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let row = sqlx::query(
         r#"
         SELECT
@@ -830,7 +848,7 @@ pub async fn get_thread_metadata_by_event(
     )
     .bind(community_id.as_uuid())
     .bind(event_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?;
 
     let row = match row {
@@ -935,8 +953,13 @@ impl Db {
             ),
             None => ("thread_head", RoutePredicate::Bounded),
         };
-        if let RouteDecision::Replica(mut tx, entry, reason) =
-            self.route_read(path, predicate).await
+        if let RouteDecision::Replica(mut tx, entry, reason) = self
+            .route_read(
+                path,
+                predicate,
+                crate::observability::ReaderOperation::SubscriptionHistory,
+            )
+            .await
         {
             match crate::thread::get_thread_replies_on(
                 &mut tx,
@@ -1062,6 +1085,7 @@ impl Db {
             .route_read(
                 path,
                 RoutePredicate::from_channel_cursor(channel_id, &cursor),
+                crate::observability::ReaderOperation::SubscriptionHistory,
             )
             .await
         {
