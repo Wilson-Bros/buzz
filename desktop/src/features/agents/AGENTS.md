@@ -153,8 +153,8 @@ with a TypeScript lookup table or an id comparison in a component.
    place that resolves it for dialog surfaces and publishes it through
    `ui/AgentRunLocationContext.tsx`; the field reads that context and lets an
    explicit `runLocation` prop win. Do **not** thread the value as a prop
-   through `AgentDefinitionDialog` / `AgentInstanceEditDialog` — both are
-   already over the 1000-line ceiling, and neither uses the value itself.
+   through `AgentDefinitionDialog` / `AgentInstanceEditDialog` — neither uses
+   the value itself, and the shared context keeps the dialog boundary stable.
    Surfaces rendered outside `AgentDialog` (e.g. `EditRespondToDialog`) pass the
    prop directly. Local names "your
    computer, including files, accounts, and connected tools"; remote names "the
@@ -204,39 +204,24 @@ with a TypeScript lookup table or an id comparison in a component.
 14. **Thinking effort has two surfaces: a local-only WRITE control and a
    read-only two-facts DISPLAY.** The write control is `EffortPickerField`
    (`ui/EffortPickerField.tsx`), a self-contained section component mounted in
-   `AgentInstanceEditDialog` beside the Model block. It is **Save-gated and
-   embedded in the locked `UpdateManagedAgentInput`** (PR #4625): the picker
-   is a controlled field (dialog holds the pending selection), and Save persists
-   the selection via `input.effortLevel` inside the locked `update_managed_agent`
-   call — NOT via a separate `persistAgentEffortLevel` IPC. This guarantees
-   that an access-policy-change restart snapshots the NEW effort atomically
-   (the restart happens after the locked save that wrote it). The standalone
-   `persist_agent_effort_level` Tauri command has been removed (PR #4625 pass 3);
-   global/onboarding surfaces persist effort through their own env-map save
-   path (`set_global_agent_config`) and do NOT write managed-agent records
-   through any standalone effort setter. It must NOT persist on selection — a
-   direct-write on selection
-   races the dialog's own locked save (a delayed effort IPC can restore a pin
-   the pin→inherit save just cleared) and can commit a write a Cancel or failed
-   Save should have discarded. On the pin→inherit transition the locked save
-   already clears the effort column and aliases, so `effortLevel` is suppressed
-   in `resolveEffortSubmission`; after the locked save resolves, invalidate the
-   config-surface query so the panel's canonical tier reflects the new
-   next-spawn value. Its gating and option compute live in the pure helper
-   `ui/effortPicker.ts` (`effortPickerState`): the picker renders only when
+   `AgentInstanceEditDialog` beside the Model block. It is direct-write, not
+   part of the frozen `UpdateManagedAgentInput` shape: each selection calls
+   `persistAgentEffortLevel` and invalidates the config-surface query, mirroring
+   the `setManagedAgentAutoRestart` standalone-setter precedent. Its gating and
+   option compute live in the pure helper `ui/effortPicker.ts`
+   (`effortPickerState`): the picker renders only when
    `agent.backend.type === "local"` **AND** a `thought_level` `effortConfigId`
    has been discovered from the running session (absent pre-first-session and
    for runtimes/models without effort support). Local-only is load-bearing, not
-   cosmetic — the locked `update_managed_agent`
-   rejects non-local backends because remote effort is set at deploy time via
-   `policy_env`. The field owns no mutation: the dialog holds the pending
-   selection and threads it as `value`/`onChange` props, and the single write
-   lives in `handleSubmit` (effort embedded in the locked update), so there is
-   exactly one effort write path and it is gated on Save. The read-only display is the `thinkingEffort`
+   cosmetic — the Rust command rejects non-local backends because remote effort
+   is set at deploy time via `policy_env`. Because it reads its inputs from the
+   config surface the dialog already fetches (`useAgentConfigSurface`) and owns
+   its own mutation, it does **not** thread new props through the dialog (see
+   rule 11): keep effort state inside the section component, never as
+   dialog-level props. The read-only display is the `thinkingEffort`
    normalized field rendered by `AgentConfigPanel` via `NormalizedRow`, which
-   already shows both facts — `field.value` (canonical: the effort the next
-   spawn will launch with, projected to the runtime's native key) and, when a
-   running ACP session differs,
+   already shows both facts — `field.value` (canonical, the effort the next
+   spawn will launch with) and, when a running ACP session differs,
    `field.overriddenValue` struck through (the live session's current effort).
    No component owns "configured vs current" logic; the reader's canonical tier
    ordering feeds both facts. Do not add a second effort write path or restate
