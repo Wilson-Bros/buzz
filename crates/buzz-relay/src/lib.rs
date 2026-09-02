@@ -6,6 +6,11 @@ mod admission;
 mod build_info;
 mod rejection;
 
+/// NIP-FI relay-level configuration (issuer set, session lifetime, JWKS warm).
+pub mod nip_fi_config;
+/// NIP-FI assertion validation at WebSocket upgrade.
+pub(crate) mod nip_fi_upgrade;
+
 /// REST API route handlers.
 pub mod api;
 /// WebSocket audio relay for huddle voice channels.

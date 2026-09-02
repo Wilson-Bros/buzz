@@ -467,6 +467,81 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    // NIP-FI JWKS warm + background refresh.
+    //
+    // Per [FI-TRACE-DEPENDENCY-FAIL-CLOSED]: a JWKS warm fetch failure at
+    // startup must NOT abort the process — relay availability cannot be
+    // hostage to IdP availability. The relay starts and denies admissions
+    // with `authorization_unavailable` (503) until a snapshot lands. The
+    // background refresh loop owns recovery, retrying on every tick.
+    //
+    // The state holds `nip_fi_jwks_source` (shared via `Arc`) alongside
+    // `nip_fi_verifier` (which holds a clone of the same `Arc`). Warming the
+    // source delivers snapshots to the verifier at every upgrade check.
+    if let Some(jwks_source) = state.nip_fi_jwks_source.clone() {
+        let jwks_configs = state.config.nip_fi.jwks_configs.clone();
+        info!(
+            issuer_count = jwks_configs.len(),
+            "NIP-FI: warming JWKS snapshots"
+        );
+
+        // Startup warm: call `get_snapshot` for each issuer. At startup the
+        // internal cache is empty, so this triggers a fetch and stores the
+        // result. Returns `None` on failure — we log a warn and continue; the
+        // relay starts and denies with 503 until a subsequent fetch succeeds.
+        for cfg in &jwks_configs {
+            match jwks_source.get_snapshot(&cfg.issuer).await {
+                Some(_) => {
+                    info!(issuer = %cfg.issuer, "NIP-FI: JWKS snapshot warmed");
+                }
+                None => {
+                    warn!(
+                        issuer = %cfg.issuer,
+                        "NIP-FI: JWKS warm failed — admissions will deny with 503 \
+                         until a snapshot lands; background refresh will retry"
+                    );
+                }
+            }
+        }
+
+        // Background refresh loop: re-invoke `get_snapshot` on every tick.
+        // `get_snapshot` refreshes inline when the cached snapshot is stale
+        // (age ≥ contract.refresh_interval_seconds) and is a no-op otherwise,
+        // so calling it periodically at the minimum configured refresh interval
+        // is correct and safe.
+        let refresh_source = Arc::clone(&jwks_source);
+        tokio::spawn(async move {
+            let base_interval_secs = jwks_configs
+                .iter()
+                .map(|c| c.contract.refresh_interval_seconds())
+                .min()
+                .unwrap_or(300);
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(base_interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                interval.tick().await;
+                for cfg in &jwks_configs {
+                    match refresh_source.get_snapshot(&cfg.issuer).await {
+                        Some(_) => {
+                            tracing::debug!(
+                                issuer = %cfg.issuer,
+                                "NIP-FI: JWKS snapshot refreshed"
+                            );
+                        }
+                        None => {
+                            tracing::warn!(
+                                issuer = %cfg.issuer,
+                                "NIP-FI: JWKS refresh failed — will retry on next tick"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
     // relay behaves byte-identically to a build without the mesh. When

@@ -355,6 +355,21 @@ async fn nip11_or_ws_handler(
     };
 
     let max_frame_bytes = state.config.max_frame_bytes;
+
+    // NIP-FI assertion check at upgrade — before the WebSocket handshake, so
+    // a denied request gets an HTTP response, not a WebSocket close.
+    // [FI-TRACE-TRANSPORT-CLOSED]
+    let nip_fi_assertion = {
+        use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
+        let mode = state.config.nip_fi.mode;
+        let verifier = state.nip_fi_verifier.as_deref();
+        match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+            NipFiUpgradeOutcome::NotRequired => None,
+            NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
+            NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
+        }
+    };
+
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
             // Shutting down: refuse new sockets instead of accepting a
@@ -367,7 +382,9 @@ async fn nip11_or_ws_handler(
                 return (StatusCode::SERVICE_UNAVAILABLE, "relay restarting").into_response();
             }
             limit_relay_websocket(ws, max_frame_bytes)
-                .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
+                .on_upgrade(move |socket| {
+                    handle_connection(socket, state, addr, tenant, nip_fi_assertion)
+                })
                 .into_response()
         }
         Err(_) => {

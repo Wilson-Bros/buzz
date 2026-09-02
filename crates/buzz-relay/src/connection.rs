@@ -85,6 +85,22 @@ pub struct ConnectionState {
     pub backpressure_count: Arc<AtomicU8>,
     /// Configurable slow-client grace limit (from `Config::slow_client_grace_limit`).
     pub grace_limit: u8,
+
+    /// The NIP-FI assertion presented at upgrade, when enforcement is enabled.
+    ///
+    /// `None` means the relay is in `Off` mode — no assertion is required.
+    /// When `Some`, the NIP-42 key pairing check uses this to enforce that
+    /// `assertion.asserted_key() == nip42_pubkey` unconditionally (S3 invariant:
+    /// no flag reads — S2 deletes `require_attested_key`). [FI-INV-05]
+    pub nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
+
+    /// The UTC deadline after which this connection's NIP-FI lease expires.
+    ///
+    /// `None` means no assertion-based lifetime is enforced (mode is `Off`).
+    /// When `Some`, the session-expiry task fires at this instant and sends
+    /// `restricted: authorization denied` + cancels. Equality is expired.
+    /// [FI-TRACE-LEASE-BOUND]
+    pub session_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ConnectionState {
@@ -128,6 +144,7 @@ pub async fn handle_connection(
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
+    nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
 ) {
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
@@ -142,7 +159,17 @@ pub async fn handle_connection(
         community_id,
         control,
         move || async move { check_state.db.is_community_active(community_id).await },
-        move |control| handle_active_connection(socket, run_state, addr, tenant, conn_id, control),
+        move |control| {
+            handle_active_connection(
+                socket,
+                run_state,
+                addr,
+                tenant,
+                conn_id,
+                control,
+                nip_fi_assertion,
+            )
+        },
     )
     .await;
 }
@@ -154,6 +181,7 @@ async fn handle_active_connection(
     tenant: TenantContext,
     conn_id: Uuid,
     control: CommunityConnectionControl,
+    nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
 ) {
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
@@ -180,6 +208,31 @@ async fn handle_active_connection(
     let backpressure_count = Arc::new(AtomicU8::new(0));
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
 
+    // Compute the NIP-FI session deadline from the assertion.
+    //
+    // Per spec (Request and session bounds, [FI-TRACE-LEASE-BOUND]):
+    //   session_deadline = min(
+    //       assertion.upstream_authority_deadline(),   // = min(exp, iat+max_age, key-snapshot hard deadline)
+    //       connection_time + max_connection_lifetime  // partitions, never shortens per spec
+    //   )
+    //
+    // Equality at any deadline is expired. `upstream_authority_deadline()` already
+    // includes the key-snapshot hard deadline (one of the three authority_deadlines
+    // terms), so this min covers all normative terms.
+    let session_deadline = nip_fi_assertion.as_ref().map(|assertion| {
+        let upstream = assertion.upstream_authority_deadline();
+        match state.config.nip_fi.max_connection_lifetime() {
+            Some(lifetime) => {
+                let now = chrono::Utc::now();
+                let partition = now
+                    + chrono::Duration::from_std(lifetime)
+                        .unwrap_or(chrono::Duration::seconds(i64::MAX / 2));
+                upstream.min(partition)
+            }
+            None => upstream,
+        }
+    });
+
     let conn = Arc::new(ConnectionState {
         conn_id,
         tenant,
@@ -193,6 +246,8 @@ async fn handle_active_connection(
         cancel: cancel.clone(),
         backpressure_count: Arc::clone(&backpressure_count),
         grace_limit: state.config.slow_client_grace_limit,
+        nip_fi_assertion,
+        session_deadline,
     });
 
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
@@ -272,6 +327,44 @@ async fn handle_active_connection(
         }
     });
 
+    // NIP-FI session-lifetime enforcement task.
+    //
+    // Fires at `session_deadline`, sends the exact Nostr text for
+    // `authorization_denied`, and cancels the connection. No in-band renewal.
+    // [FI-TRACE-LEASE-BOUND]
+    let nip_fi_expiry_conn = Arc::clone(&conn);
+    let nip_fi_expiry_cancel = cancel.clone();
+    let nip_fi_expiry_task = conn.session_deadline.map(|deadline| {
+        tokio::spawn(async move {
+            let now = chrono::Utc::now();
+            // Equality at deadline is expired: use strict less-than to compute
+            // remaining duration. If already expired or equality holds, fire immediately.
+            let remaining = if now < deadline {
+                (deadline - now)
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO)
+            } else {
+                std::time::Duration::ZERO
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => {
+                    use buzz_auth::DenialClass;
+                    let msg = DenialClass::AuthorizationDenied.nostr_text();
+                    nip_fi_expiry_conn.send(
+                        crate::protocol::RelayMessage::notice(msg)
+                    );
+                    metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
+                    warn!(
+                        conn_id = %nip_fi_expiry_conn.conn_id,
+                        "NIP-FI session lease expired — closing connection"
+                    );
+                    nip_fi_expiry_cancel.cancel();
+                }
+                _ = nip_fi_expiry_cancel.cancelled() => {}
+            }
+        })
+    });
+
     recv_loop(
         ws_recv,
         Arc::clone(&conn),
@@ -285,6 +378,9 @@ async fn handle_active_connection(
     let _ = send_task.await;
     let _ = heartbeat_task.await;
     let _ = auth_timeout_task.await;
+    if let Some(task) = nip_fi_expiry_task {
+        let _ = task.await;
+    }
 
     for removed in state.sub_registry.remove_connection(conn.conn_id) {
         if removed.scope.is_global() {
@@ -678,6 +774,8 @@ pub(crate) mod tests {
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: None,
         };
         (Arc::new(conn), send_rx)
     }

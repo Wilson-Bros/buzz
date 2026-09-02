@@ -185,6 +185,41 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
             }
 
+            // NIP-FI key pairing [FI-INV-05]: when a federated identity assertion
+            // was presented at upgrade and contains a `nostr_pubkey` claim, the
+            // proven NIP-42 key must equal that claim. This check is unconditional —
+            // no per-issuer flag reads (S2 deletes `require_attested_key`; S3
+            // enforces the invariant structurally).
+            //
+            // Mismatch: send `restricted: authorization denied` on the control
+            // channel (priority delivery ahead of Close), cancel, return.
+            // [FI-TRACE-DENIAL-ORACLE post-establishment]
+            if let Some(ref assertion) = conn.nip_fi_assertion {
+                if let Some(asserted_key) = assertion.asserted_key() {
+                    if asserted_key != pubkey {
+                        warn!(
+                            conn_id = %conn_id,
+                            proven_pubkey = %pubkey.to_hex(),
+                            asserted_pubkey = %asserted_key.to_hex(),
+                            "NIP-FI key pairing mismatch — closing connection"
+                        );
+                        metrics::counter!(
+                            "buzz_auth_failures_total",
+                            "reason" => "nip_fi_key_mismatch"
+                        )
+                        .increment(1);
+                        *conn.auth_state.write().await = AuthState::Failed;
+                        use buzz_auth::DenialClass;
+                        let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                            RelayMessage::notice(DenialClass::AuthorizationDenied.nostr_text())
+                                .into(),
+                        ));
+                        conn.cancel.cancel();
+                        return;
+                    }
+                }
+            }
+
             // Pubkey allowlist gate — only for pubkey-only auth.
             if state.config.pubkey_allowlist_enabled
                 && auth_ctx.auth_method == buzz_auth::AuthMethod::Nip42
