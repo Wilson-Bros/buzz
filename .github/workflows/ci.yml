@@ -803,6 +803,7 @@ jobs:
             -E 'package(buzz-db) and test(/(runtime::observability::tests::postgres_tests::pool_acquire_records_success_timeout_and_error_with_wait_time|runtime::observability::tests::postgres_tests::production_db_methods_emit_exact_pool_operation_labels|runtime::observability::tests::postgres_tests::deletion_catalog_readiness_records_timeout_and_recovers|runtime::observability::tests::postgres_tests::serving_write_gate_records_cancel_timeout_success_and_recovery|runtime::postgres_tests::readiness_check_distinguishes_pool_exhaustion_from_success|runtime::postgres_tests::readiness_check_classifies_closed_pool_query_timeout_and_query_error|runtime::postgres_tests::readiness_check_cancellation_balances_waiter_and_inflight_connection|store::channel_members::postgres_tests::channel_roster_fence_verification_supports_size_one_pool|store::push::postgres_tests::matcher_claim_and_load_support_size_one_pool)/)' \
             --run-ignored ignored-only
         env:
+          BUZZ_TEST_SCHEMA_MODE: desired
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
           TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
       - name: Workflow message provenance unit tests

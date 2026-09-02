@@ -979,7 +979,7 @@ mod tests {
     ) -> u64 {
         snapshot
             .iter()
-            .find_map(|(key, _, _, value)| {
+            .filter_map(|(key, _, _, value)| {
                 (key.key().name() == "buzz_db_pool_acquisitions_total")
                     .then_some(value)
                     .map(|value| match value {
@@ -987,7 +987,7 @@ mod tests {
                         _ => panic!("legacy acquisitions must be a counter"),
                     })
             })
-            .unwrap_or(0)
+            .sum()
     }
 
     #[test]
@@ -1159,6 +1159,11 @@ mod tests {
             Some(value.into_inner())
         });
         assert_eq!(live_waiter, Some(1.0));
+        let legacy_before_cancel = legacy_acquisition_count(&before_cancel);
+        assert_eq!(
+            legacy_before_cancel, 1,
+            "the completed legacy acquisition must be counted exactly once"
+        );
         let writer_success = before_cancel.iter().any(|(key, _, _, value)| {
             if key.key().name() != "buzz_db_pool_acquire_wait_seconds" {
                 return false;
@@ -1177,6 +1182,7 @@ mod tests {
         });
         drop(cancelled);
         let after_cancel = snapshotter.snapshot().into_vec();
+        let legacy_after_cancel = legacy_acquisition_count(&after_cancel);
         let mut cancelled_terminal = None;
         let mut balanced_waiter = None;
         for (key, _, _, value) in after_cancel {
@@ -1210,8 +1216,7 @@ mod tests {
         assert_eq!(balanced_waiter, Some(0.0));
         assert_eq!(cancelled_terminal, Some(1));
         assert_eq!(
-            legacy_acquisition_count(&snapshotter.snapshot().into_vec()),
-            1,
+            legacy_after_cancel, 0,
             "cancelling a legacy seam must not expand its historical population"
         );
         let held_reader = reader_pool
