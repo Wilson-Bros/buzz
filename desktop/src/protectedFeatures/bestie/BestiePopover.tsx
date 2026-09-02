@@ -3,14 +3,29 @@ import { motion } from "motion/react";
 import * as React from "react";
 import { toast } from "sonner";
 
+import {
+  useChannelMessagesQuery,
+  useChannelSubscription,
+  useSendMessageMutation,
+} from "@/features/messages/hooks";
+import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
 import type { TimelineMessage } from "@/features/messages/types";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
+import { useProfileQuery } from "@/features/profile/hooks";
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import type {
+  Channel,
   ManagedAgent,
   ManagedAgentRuntimeStatus,
   PresenceStatus,
 } from "@/shared/api/types";
+import {
+  KIND_STREAM_MESSAGE,
+  KIND_STREAM_MESSAGE_V2,
+} from "@/shared/constants/kinds";
 import { cn } from "@/shared/lib/cn";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
 import { Textarea } from "@/shared/ui/textarea";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
@@ -121,6 +136,80 @@ function EmptyBestie() {
   );
 }
 
+function BestieConversationTranscript({
+  agent,
+  channel,
+  currentPubkey,
+  messages,
+}: {
+  agent: ManagedAgent;
+  channel: Channel;
+  currentPubkey: string | undefined;
+  messages: TimelineMessage[];
+}) {
+  const transcriptRef = React.useRef<HTMLDivElement>(null);
+  const normalizedCurrent = currentPubkey
+    ? normalizePubkey(currentPubkey)
+    : null;
+  const latestMessageKey = messages.at(-1)?.renderKey ?? messages.at(-1)?.id;
+
+  React.useLayoutEffect(() => {
+    if (!latestMessageKey) return;
+    const transcript = transcriptRef.current;
+    if (!transcript) return;
+    transcript.scrollTop = transcript.scrollHeight;
+  }, [latestMessageKey]);
+
+  return (
+    <div
+      aria-live="polite"
+      className="h-full min-h-0 max-h-48 space-y-2 overflow-y-auto pr-1"
+      data-bestie-channel-id={channel.id}
+      data-bestie-channel-name={channel.name}
+      data-testid="bestie-mini-transcript"
+      ref={transcriptRef}
+    >
+      {messages.map((message) => {
+        const authorPubkey = message.pubkey ?? message.signerPubkey;
+        const isCurrentUser = Boolean(
+          normalizedCurrent &&
+            authorPubkey &&
+            normalizePubkey(authorPubkey) === normalizedCurrent,
+        );
+        return (
+          <div
+            className={cn(
+              "flex items-end gap-2",
+              isCurrentUser ? "justify-end" : "justify-start",
+            )}
+            key={message.renderKey ?? message.id}
+          >
+            {!isCurrentUser ? (
+              <UserAvatar
+                avatarUrl={agent.avatarUrl}
+                className="h-5 w-5 shrink-0"
+                displayName={agent.name}
+                fallbackDelayMs={0}
+                size="xs"
+              />
+            ) : null}
+            <div
+              className={cn(
+                "max-w-[78%] whitespace-pre-wrap break-words rounded-2xl px-3 py-2 text-sm",
+                isCurrentUser
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-foreground",
+              )}
+            >
+              {message.body}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function BestiePopover({
   avatarLayoutId,
   contextMessage,
@@ -132,30 +221,157 @@ export function BestiePopover({
 }) {
   const bestie = useBestie();
   const [draft, setDraft] = React.useState("");
+  const [contextSent, setContextSent] = React.useState(false);
+  const [conversationChannel, setConversationChannel] =
+    React.useState<Channel | null>(null);
+  const identityQuery = useIdentityQuery();
+  const profileQuery = useProfileQuery();
+  const conversationQuery = useChannelMessagesQuery(conversationChannel);
+  useChannelSubscription(conversationChannel);
+  const sendMutation = useSendMessageMutation(
+    conversationChannel,
+    identityQuery.data,
+  );
+  const agent = bestie.assignedAgent;
+  const assignedAgentPubkey = agent?.pubkey;
+  const conversationPromiseRef = React.useRef<Promise<Channel> | null>(null);
+  const resolveConversationForOpen = React.useEffectEvent(() =>
+    bestie.resolveConversation(),
+  );
 
+  React.useEffect(() => {
+    setConversationChannel(null);
+    conversationPromiseRef.current = null;
+    if (!assignedAgentPubkey) return;
+
+    let cancelled = false;
+    const pending = resolveConversationForOpen();
+    conversationPromiseRef.current = pending;
+    void pending
+      .then((channel) => {
+        if (!cancelled) setConversationChannel(channel);
+      })
+      .catch((error) => {
+        console.warn("Couldn’t load the Bestie conversation", error);
+      })
+      .finally(() => {
+        if (conversationPromiseRef.current === pending) {
+          conversationPromiseRef.current = null;
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [assignedAgentPubkey]);
+
+  const currentPubkey = identityQuery.data?.pubkey;
+  const currentProfile = profileQuery.data;
+  const conversationProfiles = React.useMemo<UserProfileLookup>(() => {
+    if (!agent) return {};
+    const profiles: UserProfileLookup = {
+      [normalizePubkey(agent.pubkey)]: {
+        avatarUrl: agent.avatarUrl,
+        displayName: agent.name,
+        isAgent: true,
+        name: agent.name,
+        nip05Handle: null,
+        ownerPubkey: null,
+      },
+    };
+    if (currentPubkey) {
+      profiles[normalizePubkey(currentPubkey)] = {
+        avatarUrl: currentProfile?.avatarUrl ?? null,
+        displayName: "You",
+        isAgent: false,
+        name: null,
+        nip05Handle: currentProfile?.nip05Handle ?? null,
+        ownerPubkey: null,
+      };
+    }
+    return profiles;
+  }, [
+    agent,
+    currentProfile?.avatarUrl,
+    currentProfile?.nip05Handle,
+    currentPubkey,
+  ]);
+  const contextEnvelope = React.useMemo(
+    () =>
+      contextMessage
+        ? `Help me with this message from ${contextMessage.author}:\n\n> ${contextMessage.body.replaceAll("\n", "\n> ")}`
+        : null,
+    [contextMessage],
+  );
+  const conversationMessages = React.useMemo(() => {
+    if (!conversationChannel) return [];
+    return formatTimelineMessages(
+      conversationQuery.data ?? [],
+      conversationChannel,
+      currentPubkey,
+      currentProfile?.avatarUrl ?? null,
+      conversationProfiles,
+    )
+      .filter(
+        (message) =>
+          (message.kind === KIND_STREAM_MESSAGE ||
+            message.kind === KIND_STREAM_MESSAGE_V2) &&
+          !message.parentId,
+      )
+      .map((message) => {
+        if (!contextEnvelope || !message.body.startsWith(contextEnvelope)) {
+          return message;
+        }
+        return {
+          ...message,
+          body: message.body.slice(contextEnvelope.length).trim(),
+        };
+      })
+      .filter((message) => message.body.length > 0)
+      .slice(-12);
+  }, [
+    contextEnvelope,
+    conversationChannel,
+    conversationProfiles,
+    conversationQuery.data,
+    currentProfile?.avatarUrl,
+    currentPubkey,
+  ]);
   if (bestie.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading Bestie…</p>;
   }
-  if (!bestie.assignedAgent) return <EmptyBestie />;
+  if (!agent) return <EmptyBestie />;
 
-  const agent = bestie.assignedAgent;
   const presenceStatus = bestiePresenceStatus(bestie.runtime?.lifecycle);
-  const openConversation = (message?: string) => {
-    onRequestClose?.();
-    void bestie.openConversation(message).catch((error) => {
+  const sendMessage = () => {
+    const trimmedDraft = draft.trim();
+    if (!trimmedDraft) return;
+    void (async () => {
+      await bestie.ensureAgentRunning();
+      const channel =
+        conversationChannel ??
+        (await (conversationPromiseRef.current ??
+          bestie.resolveConversation()));
+      setConversationChannel(channel);
+      await sendMutation.mutateAsync({
+        content:
+          contextEnvelope && !contextSent
+            ? `${contextEnvelope}\n\n${trimmedDraft}`
+            : trimmedDraft,
+        targetChannel: channel,
+      });
+      setContextSent(true);
+      setDraft("");
+    })().catch((error) => {
       toast.error(
-        error instanceof Error ? error.message : "Couldn’t open Bestie",
+        error instanceof Error ? error.message : "Couldn’t message Bestie",
       );
     });
   };
-  const contextualDraft = contextMessage
-    ? `Help me with this message from ${contextMessage.author}:\n\n> ${contextMessage.body.replaceAll("\n", "\n> ")}\n\n${draft.trim()}`
-    : draft.trim();
 
   return (
-    <div className="space-y-4">
+    <div className="flex max-h-[min(32rem,var(--radix-popover-content-available-height,calc(100vh-2rem)))] flex-col gap-4">
       <div
-        className="flex touch-none select-none items-center gap-3 cursor-grab active:cursor-grabbing"
+        className="flex shrink-0 touch-none select-none items-center gap-3 cursor-grab active:cursor-grabbing"
         data-bestie-drag-handle
       >
         <BestieAgentLockup
@@ -174,8 +390,22 @@ export function BestiePopover({
         </Button>
       </div>
 
-      {contextMessage ? (
-        <div className="space-y-2" data-testid="bestie-message-context">
+      {conversationMessages.length > 0 && conversationChannel ? (
+        <div className="min-h-0 max-h-48 overflow-hidden">
+          <BestieConversationTranscript
+            agent={agent}
+            channel={conversationChannel}
+            currentPubkey={currentPubkey}
+            messages={conversationMessages}
+          />
+        </div>
+      ) : null}
+
+      {contextMessage && !contextSent ? (
+        <div
+          className="shrink-0 space-y-2"
+          data-testid="bestie-message-context"
+        >
           <div
             className="max-h-24 max-w-[75%] overflow-hidden rounded-xl border border-border/70 bg-muted/45 p-2.5 shadow-xs"
             data-testid="bestie-message-snapshot"
@@ -202,7 +432,7 @@ export function BestiePopover({
         </div>
       ) : null}
 
-      <div className="relative">
+      <div className="relative shrink-0">
         <Textarea
           aria-label={`Message ${agent.name}`}
           className="min-h-24 resize-none rounded-2xl pb-11"
@@ -213,8 +443,8 @@ export function BestiePopover({
         <Button
           aria-label="Send in Bestie conversation"
           className="absolute bottom-2 right-2 rounded-full"
-          disabled={!draft.trim() || bestie.isOpening}
-          onClick={() => openConversation(contextualDraft)}
+          disabled={!draft.trim() || bestie.isOpening || sendMutation.isPending}
+          onClick={sendMessage}
           size="icon"
         >
           <ArrowUp />

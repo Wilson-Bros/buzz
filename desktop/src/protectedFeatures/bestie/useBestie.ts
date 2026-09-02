@@ -118,7 +118,7 @@ export function useBestie() {
     },
   });
 
-  const openConversation = async (draft?: string) => {
+  const ensureAgentRunning = async () => {
     if (assignedAgent) {
       const action = managedAgentPairAction(runtime);
       if (action !== "stop") {
@@ -132,7 +132,15 @@ export function useBestie() {
         });
       }
     }
-    const channel = await resolveMutation.mutateAsync();
+  };
+
+  const resolveConversation = async () => {
+    return resolveMutation.mutateAsync();
+  };
+
+  const openConversation = async (draft?: string) => {
+    await ensureAgentRunning();
+    const channel = await resolveConversation();
     await goChannel(channel.id, draft ? { autoSend: draft } : undefined);
   };
 
@@ -142,6 +150,7 @@ export function useBestie() {
     assignmentError: assignmentQuery.error,
     assignAgent: assignMutation.mutateAsync,
     clearAssignment: clearMutation.mutateAsync,
+    ensureAgentRunning,
     isAssigning: assignMutation.isPending,
     isLoading:
       assignmentQuery.isLoading ||
@@ -149,6 +158,7 @@ export function useBestie() {
       runtimesQuery.isLoading,
     isOpening: resolveMutation.isPending || runtimeAction.isPending,
     openConversation,
+    resolveConversation,
     runtime,
   };
 }

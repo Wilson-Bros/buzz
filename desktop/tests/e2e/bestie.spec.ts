@@ -1,9 +1,9 @@
 import { expect, test } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
-import { installMockBridge } from "../helpers/bridge";
+import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
-const BESTIE_PUBKEY = "be".repeat(32);
+const BESTIE_PUBKEY = TEST_IDENTITIES.alice.pubkey;
 const RELAY_URL = "ws://localhost:3000";
 
 async function enableBestie(page: import("@playwright/test").Page) {
@@ -13,6 +13,23 @@ async function enableBestie(page: import("@playwright/test").Page) {
       JSON.stringify({ bestie: true }),
     );
   });
+}
+
+async function waitForMockLiveSubscription(
+  page: import("@playwright/test").Page,
+  channelName: string,
+) {
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (name) =>
+          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+            channelName: name,
+          }) ?? false,
+        channelName,
+      ),
+    )
+    .toBe(true);
 }
 
 test("assigns from an agent profile, reopens, drags, and offers the message action", async ({
@@ -150,7 +167,9 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   await expect(bloomContent).toHaveCount(0);
   await sidebarBestie.click();
   await expect(page).toHaveURL(/\/channels\//);
-  await expect(page.getByRole("heading", { name: "Mochi" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "alice-tyler" }),
+  ).toBeVisible();
   const firstConversationUrl = page.url();
   await expect(page).toHaveURL(firstConversationUrl);
   await expect(page.getByTestId("bestie-bloom-content")).toHaveCount(0);
@@ -215,6 +234,43 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   expect(snapshotBox?.width).toBeLessThanOrEqual(
     (popoverBox?.width ?? 0) * 0.75 + 1,
   );
+  const channelUrl = page.url();
+  const miniComposer = messagePopover.getByLabel("Message Mochi");
+  await miniComposer.fill("Give me a concise reply");
+  await messagePopover
+    .getByRole("button", { name: "Send in Bestie conversation" })
+    .click();
+  await expect(page).toHaveURL(channelUrl);
+  await expect(messagePopover).toBeVisible();
+  await expect(miniComposer).toHaveValue("");
+  await expect(snapshot).toHaveCount(0);
+  await expect(
+    messagePopover.getByTestId("bestie-mini-transcript"),
+  ).toContainText("Give me a concise reply");
+  const miniTranscript = messagePopover.getByTestId("bestie-mini-transcript");
+  const bestieChannelName = await miniTranscript.getAttribute(
+    "data-bestie-channel-name",
+  );
+  expect(bestieChannelName).toBeTruthy();
+  await waitForMockLiveSubscription(page, bestieChannelName as string);
+  await page.evaluate(
+    ({ channelName, pubkey }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName,
+        content: "Here’s the concise reply.",
+        pubkey,
+      });
+    },
+    { channelName: bestieChannelName as string, pubkey: BESTIE_PUBKEY },
+  );
+  await expect(miniTranscript).toContainText("Here’s the concise reply.");
+
+  await miniComposer.fill("One more thought");
+  await messagePopover
+    .getByRole("button", { name: "Send in Bestie conversation" })
+    .click();
+  await expect(page).toHaveURL(channelUrl);
+  await expect(miniTranscript).toContainText("One more thought");
   await waitForAnimations(page);
   await messagePopover.screenshot({
     path: "test-results/bestie/02-message-popover.png",
