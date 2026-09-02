@@ -176,7 +176,7 @@ export function BestieGlobalOverlay() {
             menuWidth={320}
             motionDisabled={dragging}
             onMorphAnimationComplete={(isOpen) => {
-              setShareAvatarLayout(!isOpen);
+              if (isOpen) setShareAvatarLayout(false);
             }}
           >
             <Bloom.Trigger

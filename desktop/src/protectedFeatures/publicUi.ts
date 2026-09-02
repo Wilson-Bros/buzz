@@ -1,5 +1,5 @@
 import type { TimelineMessage } from "@/features/messages/types";
-import type { ManagedAgent } from "@/shared/api/types";
+import type { Channel, ManagedAgent } from "@/shared/api/types";
 
 export function ProtectedGlobalOverlay() {
   return null;
@@ -22,4 +22,11 @@ export function ProtectedBestieCardBadge(_props: { agent: ManagedAgent }) {
 
 export function ProtectedBestieSidebarEntry() {
   return null;
+}
+
+export function useProtectedVisibleDirectMessages(
+  channels: Channel[],
+  _currentPubkey: string | undefined,
+) {
+  return channels;
 }

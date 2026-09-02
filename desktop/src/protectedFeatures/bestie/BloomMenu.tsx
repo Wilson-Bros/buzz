@@ -146,6 +146,7 @@ function Container({
           width: open ? menuWidth : buttonSize,
         }}
         className={className}
+        data-testid="bestie-bloom-container"
         initial={false}
         onAnimationComplete={() => onMorphAnimationComplete?.(open)}
         onClick={(event) => {
@@ -167,7 +168,7 @@ function Container({
           zIndex: open ? 50 : "auto",
         }}
         transition={
-          reduceMotion || motionDisabled || !open
+          reduceMotion || motionDisabled
             ? { duration: 0 }
             : { bounce: 0.15, type: "spring", visualDuration: 0.25 }
         }
@@ -214,7 +215,7 @@ function Trigger({
   children: React.ReactNode;
   className?: string;
 }) {
-  const { open, setOpen, triggerRef } = useBloomContext();
+  const { anchor, direction, open, setOpen, triggerRef } = useBloomContext();
   if (open) return null;
 
   return (
@@ -236,6 +237,11 @@ function Trigger({
       }}
       ref={triggerRef}
       role="button"
+      style={{
+        ...(anchor === "end" ? { right: 0 } : { left: 0 }),
+        ...(direction === "top" ? { bottom: 0 } : { top: 0 }),
+        position: "absolute",
+      }}
       tabIndex={0}
     >
       {children}
@@ -250,7 +256,7 @@ function Content({
   children: React.ReactNode;
   className?: string;
 }) {
-  const { contentRef, direction, open } = useBloomContext();
+  const { anchor, contentRef, direction, open } = useBloomContext();
   const reduceMotion = useReducedMotion();
   const hiddenY = direction === "top" ? 8 : -8;
 
@@ -282,6 +288,15 @@ function Content({
           key="bloom-content"
           ref={contentRef}
           role="menu"
+          style={{
+            transformOrigin: `${
+              anchor === "start"
+                ? "left"
+                : anchor === "end"
+                  ? "right"
+                  : "center"
+            } ${direction === "top" ? "bottom" : "top"}`,
+          }}
           transition={
             reduceMotion
               ? { duration: 0.12 }

@@ -92,6 +92,9 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   ).toHaveAttribute("draggable", "false");
   const sidebarBestie = page.getByTestId("bestie-sidebar-entry");
   await expect(sidebarBestie).toContainText("Mochi");
+  await expect(
+    page.getByTestId("dm-list").getByTestId("channel-alice-tyler"),
+  ).toHaveCount(0);
   expect(
     await sidebarBestie.evaluate(
       (element) =>
@@ -152,6 +155,9 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   await page.mouse.up();
   const openPanelAfterDrag = await bloomContent.boundingBox();
   const openAvatarAfterDrag = await bloomAvatar.boundingBox();
+  const openContainerAfterDrag = await page
+    .getByTestId("bestie-bloom-container")
+    .boundingBox();
   const panelDelta = {
     x: (openPanelAfterDrag?.x ?? 0) - (openPanelBeforeDrag?.x ?? 0),
     y: (openPanelAfterDrag?.y ?? 0) - (openPanelBeforeDrag?.y ?? 0),
@@ -165,6 +171,16 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
 
   await bloomContent.getByRole("button", { name: "Close Bestie" }).click();
   await expect(bloomContent).toHaveCount(0);
+  await waitForAnimations(page);
+  const closeAnchor = await floatingAvatar.boundingBox();
+  expect(
+    Math.abs(
+      (closeAnchor?.x ?? 0) +
+        (closeAnchor?.width ?? 0) -
+        ((openContainerAfterDrag?.x ?? 0) +
+          (openContainerAfterDrag?.width ?? 0)),
+    ),
+  ).toBeLessThan(1);
   await sidebarBestie.click();
   await expect(page).toHaveURL(/\/channels\//);
   await expect(
@@ -177,6 +193,7 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   await floatingAvatar.click();
   await expect(page.getByTestId("bestie-activity-dot").last()).toBeVisible();
   await page.getByRole("button", { name: "Close Bestie" }).click();
+  await waitForAnimations(page);
   const beforeDrag = await floatingAvatar.boundingBox();
   const collapsedAvatar = floatingAvatar.getByTestId("bestie-trigger-avatar");
   const collapsedAvatarBeforeDrag = await collapsedAvatar.boundingBox();
