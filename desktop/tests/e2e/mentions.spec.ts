@@ -857,7 +857,11 @@ test("blocks non-participant persona mentions in DM threads", async ({
       .getByTestId("mention-autocomplete")
       .locator("button", { hasText: "Fizz" }),
   ).toBeVisible();
-  await input.press("Enter");
+  await threadPanel
+    .getByTestId("mention-autocomplete")
+    .locator("button", { hasText: "Fizz" })
+    .click();
+  await expect(input).toHaveText("Ask @Fizz ");
   await page.keyboard.type(" in this thread");
   const baselineCommands = await readCommandLog(page);
 
@@ -869,6 +873,9 @@ test("blocks non-participant persona mentions in DM threads", async ({
     ),
   ).toBeVisible();
   const commands = await readCommandLog(page);
+  expect(commandCount(await readCommandLog(page), "sign_event")).toBe(
+    commandCount(baselineCommands, "sign_event"),
+  );
   expect(commandCount(commands, "create_managed_agent")).toBe(
     commandCount(baselineCommands, "create_managed_agent"),
   );
@@ -915,7 +922,11 @@ test("defers agent mentions until DM members finish loading", async ({
       .getByTestId("mention-autocomplete")
       .locator("button", { hasText: "alice" }),
   ).toBeVisible();
-  await input.press("Enter");
+  await threadPanel
+    .getByTestId("mention-autocomplete")
+    .locator("button", { hasText: "alice" })
+    .click();
+  await expect(input).toHaveText("Ask @alice ");
   await page.keyboard.type(" before members resolve");
   const baselineCommands = await readCommandLog(page);
   await threadPanel.getByTestId("send-message").click();
@@ -924,6 +935,9 @@ test("defers agent mentions until DM members finish loading", async ({
     page.getByText(DM_THREAD_MEMBERS_LOADING_ERROR_TEXT).first(),
   ).toBeVisible();
   await page.mouse.move(0, 0);
+  expect(commandCount(await readCommandLog(page), "sign_event")).toBe(
+    commandCount(baselineCommands, "sign_event"),
+  );
   expect(commandCount(await readCommandLog(page), "add_channel_members")).toBe(
     commandCount(baselineCommands, "add_channel_members"),
   );
@@ -938,8 +952,15 @@ test("defers agent mentions until DM members finish loading", async ({
   expect(commandCount(await readCommandLog(page), "add_channel_members")).toBe(
     commandCount(baselineCommands, "add_channel_members"),
   );
-  await expect(input).toHaveText("@alice ");
+  // A one-time mention does not opt into automatic addressing after send.
+  await expect(input).toHaveText("");
   await expect(threadPanel).toContainText("before members resolve");
+  expect(
+    await readOutgoingMentionPubkeys(
+      page,
+      "Ask @alice  before members resolve",
+    ),
+  ).toEqual([TEST_IDENTITIES.alice.pubkey]);
 });
 
 test("autocomplete filters managed-agent suggestions as user types", async ({
@@ -1350,7 +1371,8 @@ test("selecting a persona mention creates a channel agent before sending", async
   await expect(fizzRow.getByTestId("mention-agent-icon")).toBeVisible();
   await expect(fizzRow.getByText("agent")).toBeVisible();
   await expect(fizzRow.getByText("not in channel")).toBeVisible();
-  await input.press("Enter");
+  await fizzRow.click();
+  await expect(input).toHaveText("Ask @Fizz ");
   await page.keyboard.type(" for a hand");
 
   const composerChip = input.locator(".agent-mention-highlight", {
@@ -1435,7 +1457,8 @@ test("selecting a persona mention reuses an existing persona agent", async ({
   const dropdown = autocomplete(page);
   const fizzRow = dropdown.locator("button", { hasText: "Fizz" });
   await expect(fizzRow).toBeVisible();
-  await input.press("Enter");
+  await fizzRow.click();
+  await expect(input).toHaveText("Ask @Fizz ");
   await page.keyboard.type(" for a hand");
 
   const baselineCommands = await readCommandLog(page);
@@ -2522,7 +2545,8 @@ test("mentioning a non-member managed agent adds and starts it before sending", 
   const fizzRow = dropdown.locator("button", { hasText: "fizz" });
   await expect(fizzRow).toBeVisible();
   await expect(fizzRow.getByText("not in channel")).toBeVisible();
-  await input.press("Enter");
+  await fizzRow.click();
+  await expect(input).toHaveText("Loop in @fizz ");
 
   const baselineCommands = await readCommandLog(page);
   const baselineAddCount = commandCount(
@@ -2628,7 +2652,8 @@ test("mentioning a non-member provider managed agent deploys it before sending",
   const portalRow = dropdown.locator("button", { hasText: "portal" });
   await expect(portalRow).toBeVisible();
   await expect(portalRow.getByText("not in channel")).toBeVisible();
-  await input.press("Enter");
+  await portalRow.click();
+  await expect(input).toHaveText("Loop in @portal ");
 
   const baselineCommands = await readCommandLog(page);
   const baselineAddCount = commandCount(
@@ -3127,7 +3152,8 @@ test("sent non-member person mention uses the normal mention style", async ({
 
   const dropdown = autocomplete(page);
   await expect(dropdown.getByText("outsider")).toBeVisible();
-  await input.press("Enter");
+  await dropdown.getByText("outsider", { exact: true }).click();
+  await expect(input).toHaveText("Loop in @outsider ");
   await page.keyboard.type(" please");
   await page.getByTestId("send-message").click();
 
@@ -3160,7 +3186,8 @@ test("sent managed non-member agent mention uses the agent mention style", async
 
   const dropdown = autocomplete(page);
   await expect(dropdown.getByText("charlie")).toBeVisible();
-  await input.press("Enter");
+  await dropdown.getByText("charlie", { exact: true }).click();
+  await expect(input).toHaveText("Loop in @charlie ");
   await page.keyboard.type(" too");
   await page.getByTestId("send-message").click();
 
@@ -3219,23 +3246,38 @@ test("inserting a mention preserves Shift+Enter newlines (regression: bug #2)", 
   await expect(input.locator("br")).toHaveCount(1);
 });
 
-test("keyboard navigation selects mention with Enter", async ({ page }) => {
-  await page.goto("/");
-  await page.getByTestId("channel-general").click();
-  await expect(page.getByTestId("chat-title")).toHaveText("general");
+for (const channel of ["general", "watercooler"]) {
+  test(`keyboard navigation selects mention with Enter in ${channel}`, async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId(`channel-${channel}`).click();
+    await expect(page.getByTestId("chat-title")).toHaveText(channel);
+    if (channel === "watercooler")
+      await page.getByRole("button", { name: "Start a new post..." }).click();
 
-  const input = page.getByTestId("message-input");
-  await input.fill("@bo");
+    const input = page.getByTestId("message-input");
+    await input.click();
+    await page.keyboard.type("@bo");
 
-  const dropdown = autocomplete(page);
-  await expect(dropdown.getByText("bob")).toBeVisible();
+    const dropdown = page.getByTestId("mention-autocomplete");
+    await expect(dropdown.getByText("bob")).toBeVisible();
 
-  // Press Enter to select the first (and only) suggestion
-  await input.press("Enter");
+    // Select deliberately after the current search settles; a visible row alone
+    // does not authorize implicit completion while more results may arrive.
+    await waitForCompleteMentionSearch(page, "bo");
+    const baselineCommands = await readCommandLog(page);
+    await input.press("ArrowDown");
+    await input.press("Enter");
 
-  // Should insert @bob and NOT send the message
-  await expect(input).toHaveText("@bob ");
-});
+    // Should insert @bob and NOT send the message
+    await expect(input).toHaveText("@bob ");
+    await expect(input.locator("p")).toHaveCount(1);
+    expect(commandCount(await readCommandLog(page), "sign_event")).toBe(
+      commandCount(baselineCommands, "sign_event"),
+    );
+  });
+}
 
 test("Escape dismisses autocomplete dropdown", async ({ page }) => {
   await page.goto("/");
