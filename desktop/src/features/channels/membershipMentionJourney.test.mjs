@@ -1,3 +1,7 @@
+import {
+  getMentionSelectionHistory,
+  resetMentionSelectionHistory,
+} from "../messages/lib/mentionSelectionHistory.ts";
 // Real create/add/roster/directory/mention hooks with a mocked Tauri boundary.
 // Agent classification and verified policy are supplied fixtures, not native proof.
 import assert from "node:assert/strict";
@@ -272,6 +276,7 @@ async function setup(overrides = {}) {
 afterEach(async () => {
   if (root) await act(async () => root.unmount());
   resetMembershipDirectorySync();
+  resetMentionSelectionHistory();
   client?.clear();
   document.body.replaceChildren();
 });
@@ -488,6 +493,7 @@ test("retained explicit pin rejects latest policy denial without draft effects",
   assert.equal(rows()[0].action, "unavailable");
   await act(async () => oldPin(row));
   assert.deepEqual(effects, []);
+  assert.equal(getMentionSelectionHistory(VIEWER, CHANNEL).length, 0);
   assert.deepEqual(mention.knownNames, []);
 });
 
@@ -511,6 +517,7 @@ for (const returnToOrigin of [false, true]) {
       edit = oldInsert(row, 1);
     });
     assert.deepEqual(effects, []);
+    assert.equal(getMentionSelectionHistory(VIEWER, CHANNEL).length, 0);
     assert.equal(edit.insertText, "");
     assert.deepEqual(mention.knownNames, []);
   });
@@ -650,6 +657,7 @@ for (const condition of ["failed", "paging", "fetching", "complete"]) {
           effect === "edit" && edit.insertText.includes("@Remote Scout"),
       ),
     );
+    assert.deepEqual(getMentionSelectionHistory(VIEWER, CHANNEL), [AGENT]);
     if (release)
       await act(async () =>
         release({
@@ -804,6 +812,7 @@ for (const key of ["Tab", "Enter", " "]) {
       "explicit picker still works without @",
     );
     assert.equal(mention.getDraftMentionRefs(edit.insertText)[0].pubkey, AGENT);
+    assert.deepEqual(getMentionSelectionHistory(VIEWER, CHANNEL), [AGENT]);
   });
 }
 test("duplicate team members cannot mask a recipient set change", async () => {
@@ -951,6 +960,7 @@ for (const [name, original, live] of [
       });
       assert.deepEqual(mention.knownNames, []);
       assert.deepEqual(effects, []);
+      assert.deepEqual(getMentionSelectionHistory(VIEWER, CHANNEL), []);
       // Refreshing the UI does not re-authorize the retained row, even if its key survives.
       await settle();
       await act(async () =>
@@ -978,6 +988,7 @@ test("explicit no-trigger menu uses the current endpoint but not a retained inli
     insertText: "@Remote Scout ",
   });
   assert.equal(mention.getDraftMentionRefs(edit.insertText)[0].pubkey, AGENT);
+  assert.deepEqual(getMentionSelectionHistory(VIEWER, CHANNEL), [AGENT]);
 });
 
 test("pending debounce cannot retarget a caret-only move to another live prefix", async () => {
@@ -1031,6 +1042,7 @@ test("keyboard result remains bound until insertion and cannot cross a channel v
     assert.equal(mention.insertMention(choice, text.length).insertText, "");
   });
   assert.deepEqual(mention.knownNames, []);
+  assert.deepEqual(getMentionSelectionHistory(VIEWER, CHANNEL), []);
 });
 
 test("default shortcut intent admits a current agent without opening an inline picker", async () => {
@@ -1045,6 +1057,7 @@ test("default shortcut intent admits a current agent without opening an inline p
   );
   assert.ok(effects.some(([kind, key]) => kind === "promote" && key === AGENT));
   assert.equal(mention.isMentionOpen, false);
+  assert.deepEqual(getMentionSelectionHistory(VIEWER, CHANNEL), []);
 });
 
 test("editing plain text refreshes an explicit menu before its next choice", async () => {
@@ -1093,6 +1106,7 @@ for (const condition of ["denied", "missing", "failed"]) {
       assert.equal(outcome.suggestion, undefined);
     }
     assert.deepEqual(effects, []);
+    assert.equal(getMentionSelectionHistory(VIEWER, CHANNEL).length, 0);
     assert.deepEqual(mention.knownNames, []);
   });
 }

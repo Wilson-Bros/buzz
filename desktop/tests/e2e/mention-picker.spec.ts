@@ -136,6 +136,15 @@ test("collision distinction, deliberate key choice, and exact publication", asyn
   await expect(page.getByTestId(`mention-suggestion-${B}`)).toContainText(
     "Online",
   );
+  const agentOrder = () =>
+    page
+      .locator("[data-mention-suggestion-index]")
+      .evaluateAll((rows) =>
+        rows.map((row) => row.getAttribute("data-testid")),
+      );
+  await expect
+    .poll(agentOrder)
+    .toEqual([`mention-suggestion-${A}`, `mention-suggestion-${B}`]);
   await input.press("Tab");
   if (parent) {
     await capture(page, "duplicates-tab");
@@ -150,6 +159,9 @@ test("collision distinction, deliberate key choice, and exact publication", asyn
     .first()
     .click();
   await page.keyboard.type("and @Scout");
+  await expect
+    .poll(agentOrder)
+    .toEqual([`mention-suggestion-${B}`, `mention-suggestion-${A}`]);
   await page
     .getByTestId(`mention-suggestion-${A}`)
     .locator("button")
