@@ -96,8 +96,15 @@ sync_upstream() {
     echo "Commit or stash local changes before syncing upstream." >&2
     return 1
   fi
+  if [[ "$(git branch --show-current)" != "main" ]]; then
+    echo "Switch to the shared main branch before syncing upstream." >&2
+    return 1
+  fi
+  git fetch origin main
+  git merge --ff-only origin/main
   git fetch upstream main
-  git rebase upstream/main
+  git merge --no-edit upstream/main
+  git push origin main
 }
 
 print_help() {
@@ -112,7 +119,7 @@ Usage: ./josh <command> [args]
   build    Build a stable, isolated "Buzz Josh.app" bundle
   install  Build and copy "Buzz Josh.app" into ~/Applications
   open     Open the installed "Buzz Josh.app"
-  sync     Rebase a clean branch onto the latest official upstream/main
+  sync     Merge collaborators and official updates into shared main
   status   Show branch, working-tree, and upstream divergence
   help     Show this help
 

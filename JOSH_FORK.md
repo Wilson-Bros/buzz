@@ -1,10 +1,17 @@
 # Josh's Buzz fork
 
-This checkout is Josh's long-lived, mutable Buzz desktop client. It keeps the
-official repository as `upstream` and carries local changes on
-`codex/josh-buzz`.
+This checkout is Josh and Daniel's shared, mutable Buzz desktop client. The
+shared fork is [Wilson-Bros/buzz](https://github.com/Wilson-Bros/buzz), its
+`origin` remote points there, and the official Block repository remains
+`upstream`.
 
 ## Daily use
+
+There is no daily terminal routine. Open **Buzz Josh** from Spotlight or the
+Applications folder and use it like any other app. It stays installed until a
+new custom build replaces it.
+
+Use the command below only while actively editing Buzz:
 
 ```bash
 ./josh dev
@@ -47,20 +54,24 @@ After code changes, use `./josh dev` while iterating, then `./josh check` and
 
 ## Keeping up with official Buzz
 
-Commit local work before syncing, then run:
+This is occasional maintenance, not a daily task. Do it before starting a new
+round of changes or when an official Buzz fix is worth pulling in. Commit local
+work first, then run:
 
 ```bash
 ./josh sync
 ```
 
-The command fetches `upstream/main` and rebases the current branch onto it. If
-Git stops on a conflict, resolve it, run the relevant checks, and continue with
-`git rebase --continue`. `./josh status` shows the working tree and the number
-of commits on each side of official Buzz.
+The command first fast-forwards to any Josh/Daniel changes already on
+`origin/main`, merges the latest `upstream/main`, and pushes the result back to
+the shared fork. It never rewrites published shared history. If Git stops on a
+conflict, resolve it and run the relevant checks before pushing. `./josh
+status` shows the working tree and upstream divergence.
 
-There is intentionally no `origin` remote yet: creating or choosing Josh's
-GitHub fork is a separate account-level action. Until then, the checkout and
-local commits are fully usable, but they are not backed up to GitHub.
+Daniel has explicit write access through the Wilson Bros organization. He can
+clone `https://github.com/Wilson-Bros/buzz.git`, make a branch, and open a pull
+request into the fork's `main` branch. Because the official project is public,
+the GitHub fork is public too.
 
 ## Safety boundary
 
