@@ -7,9 +7,16 @@ import {
   useChannelMessagesQuery,
   useChannelSubscription,
   useSendMessageMutation,
+  useToggleReactionMutation,
 } from "@/features/messages/hooks";
 import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
+import {
+  hasSameMessageAuthor,
+  isWithinGroupingWindow,
+  startsNewMessageGroup,
+} from "@/features/messages/lib/messageGrouping";
 import type { TimelineMessage } from "@/features/messages/types";
+import { MessageRow } from "@/features/messages/ui/MessageRow";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { useProfileQuery } from "@/features/profile/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
@@ -124,20 +131,23 @@ function EmptyBestie() {
 }
 
 function BestieConversationTranscript({
-  agent,
   channel,
   currentPubkey,
   messages,
+  onToggleReaction,
+  profiles,
 }: {
-  agent: ManagedAgent;
   channel: Channel;
   currentPubkey: string | undefined;
   messages: TimelineMessage[];
+  onToggleReaction: (
+    message: TimelineMessage,
+    emoji: string,
+    remove: boolean,
+  ) => Promise<void>;
+  profiles: UserProfileLookup;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
-  const normalizedCurrent = currentPubkey
-    ? normalizePubkey(currentPubkey)
-    : null;
   const latestMessageKey = messages.at(-1)?.renderKey ?? messages.at(-1)?.id;
 
   React.useLayoutEffect(() => {
@@ -150,47 +160,35 @@ function BestieConversationTranscript({
   return (
     <div
       aria-live="polite"
-      className="h-full min-h-0 max-h-48 space-y-2 overflow-y-auto pr-1"
+      className="h-full min-h-0 max-h-48 overflow-y-auto"
       data-bestie-channel-id={channel.id}
       data-bestie-channel-name={channel.name}
       data-testid="bestie-mini-transcript"
       ref={transcriptRef}
     >
-      {messages.map((message) => {
-        const authorPubkey = message.pubkey ?? message.signerPubkey;
-        const isCurrentUser = Boolean(
-          normalizedCurrent &&
-            authorPubkey &&
-            normalizePubkey(authorPubkey) === normalizedCurrent,
+      {messages.map((message, index) => {
+        const previousMessage = messages[index - 1];
+        const isContinuation = Boolean(
+          previousMessage &&
+            !startsNewMessageGroup(message) &&
+            hasSameMessageAuthor(previousMessage, message) &&
+            isWithinGroupingWindow(
+              previousMessage.createdAt,
+              message.createdAt,
+            ),
         );
         return (
-          <div
-            className={cn(
-              "flex items-end gap-2",
-              isCurrentUser ? "justify-end" : "justify-start",
-            )}
+          <MessageRow
+            actionBarPlacement="inside"
+            channelId={channel.id}
+            currentPubkey={currentPubkey}
+            isContinuation={isContinuation}
             key={message.renderKey ?? message.id}
-          >
-            {!isCurrentUser ? (
-              <UserAvatar
-                avatarUrl={agent.avatarUrl}
-                className="h-5 w-5 shrink-0"
-                displayName={agent.name}
-                fallbackDelayMs={0}
-                size="xs"
-              />
-            ) : null}
-            <div
-              className={cn(
-                "max-w-[78%] whitespace-pre-wrap break-words rounded-2xl px-3 py-2 text-sm",
-                isCurrentUser
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-muted text-foreground",
-              )}
-            >
-              {message.body}
-            </div>
-          </div>
+            message={message}
+            onToggleReaction={onToggleReaction}
+            profiles={profiles}
+            showDepthGuides={false}
+          />
         );
       })}
     </div>
@@ -219,6 +217,11 @@ export function BestiePopover({
     conversationChannel,
     identityQuery.data,
   );
+  const toggleReactionMutation = useToggleReactionMutation();
+  const toggleReactionMutateRef = React.useRef(
+    toggleReactionMutation.mutateAsync,
+  );
+  toggleReactionMutateRef.current = toggleReactionMutation.mutateAsync;
   const agent = bestie.assignedAgent;
   const assignedAgentPubkey = agent?.pubkey;
   const conversationPromiseRef = React.useRef<Promise<Channel> | null>(null);
@@ -323,6 +326,16 @@ export function BestiePopover({
     currentProfile?.avatarUrl,
     currentPubkey,
   ]);
+  const handleToggleReaction = React.useCallback(
+    async (message: TimelineMessage, emoji: string, remove: boolean) => {
+      await toggleReactionMutateRef.current({
+        emoji,
+        eventId: message.id,
+        remove,
+      });
+    },
+    [],
+  );
   if (bestie.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading Bestie…</p>;
   }
@@ -331,7 +344,7 @@ export function BestiePopover({
   const presenceStatus = bestie.presenceStatus ?? "offline";
   const sendMessage = () => {
     const trimmedDraft = draft.trim();
-    if (!trimmedDraft) return;
+    if (!trimmedDraft || bestie.isOpening || sendMutation.isPending) return;
     void (async () => {
       const startResult = bestie.ensureAgentRunning().then(
         () => ({ error: null }),
@@ -385,10 +398,11 @@ export function BestiePopover({
       {conversationMessages.length > 0 && conversationChannel ? (
         <div className="min-h-0 max-h-48 overflow-hidden">
           <BestieConversationTranscript
-            agent={agent}
             channel={conversationChannel}
             currentPubkey={currentPubkey}
             messages={conversationMessages}
+            onToggleReaction={handleToggleReaction}
+            profiles={conversationProfiles}
           />
         </div>
       ) : null}
@@ -429,6 +443,20 @@ export function BestiePopover({
           aria-label={`Message ${agent.name}`}
           className="min-h-24 resize-none rounded-2xl pb-11"
           onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (
+              event.key !== "Enter" ||
+              event.shiftKey ||
+              event.altKey ||
+              event.ctrlKey ||
+              event.metaKey ||
+              event.nativeEvent.isComposing
+            ) {
+              return;
+            }
+            event.preventDefault();
+            sendMessage();
+          }}
           placeholder={`Message ${agent.name}`}
           value={draft}
         />

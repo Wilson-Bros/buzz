@@ -237,38 +237,60 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   const channelUrl = page.url();
   const miniComposer = messagePopover.getByLabel("Message Mochi");
   await miniComposer.fill("Give me a concise reply");
-  await messagePopover
-    .getByRole("button", { name: "Send in Bestie conversation" })
-    .click();
+  await miniComposer.press("Shift+Enter");
+  await miniComposer.pressSequentially("with one example");
+  await expect(miniComposer).toHaveValue(
+    "Give me a concise reply\nwith one example",
+  );
+  await expect(
+    messagePopover.getByTestId("bestie-mini-transcript"),
+  ).toHaveCount(0);
+  await miniComposer.press("Enter");
   await expect(page).toHaveURL(channelUrl);
   await expect(messagePopover).toBeVisible();
   await expect(miniComposer).toHaveValue("");
   await expect(snapshot).toHaveCount(0);
   await expect(
     messagePopover.getByTestId("bestie-mini-transcript"),
-  ).toContainText("Give me a concise reply");
+  ).toContainText("Give me a concise reply\nwith one example");
   const miniTranscript = messagePopover.getByTestId("bestie-mini-transcript");
+  const sentMessageRow = miniTranscript
+    .getByTestId("message-row")
+    .filter({ hasText: "Give me a concise reply" });
+  await expect(sentMessageRow).toBeVisible();
+  const sentMessageId = await sentMessageRow.getAttribute("data-message-id");
+  expect(sentMessageId).toBeTruthy();
   const bestieChannelName = await miniTranscript.getAttribute(
     "data-bestie-channel-name",
   );
   expect(bestieChannelName).toBeTruthy();
   await waitForMockLiveSubscription(page, bestieChannelName as string);
   await page.evaluate(
-    ({ channelName, pubkey }) => {
+    ({ channelName, pubkey, targetId }) => {
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName,
         content: "Here’s the concise reply.",
         pubkey,
       });
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName,
+        content: "👀",
+        extraTags: [["e", targetId]],
+        kind: 7,
+        pubkey,
+      });
     },
-    { channelName: bestieChannelName as string, pubkey: BESTIE_PUBKEY },
+    {
+      channelName: bestieChannelName as string,
+      pubkey: BESTIE_PUBKEY,
+      targetId: sentMessageId as string,
+    },
   );
   await expect(miniTranscript).toContainText("Here’s the concise reply.");
+  await expect(sentMessageRow.getByLabel("Toggle 👀 reaction")).toBeVisible();
 
   await miniComposer.fill("One more thought");
-  await messagePopover
-    .getByRole("button", { name: "Send in Bestie conversation" })
-    .click();
+  await miniComposer.press("Enter");
   await expect(page).toHaveURL(channelUrl);
   await expect(miniTranscript).toContainText("One more thought");
   await waitForAnimations(page);
