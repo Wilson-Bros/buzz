@@ -1190,6 +1190,58 @@ test("typing an unregistered @token before existing text is left alone", async (
   await expect(input).toHaveText("hello @zzq world");
 });
 
+test("wrapped channel references keep the icon on the first composer line", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const input = page.getByTestId("message-input");
+  await page.getByTestId("message-input-scroll").evaluate((element) => {
+    element.style.width = "74px";
+  });
+  await input.fill("#all-replies");
+
+  const channelChip = input.locator(".inline-chip-icon-channel", {
+    hasText: "all-replies",
+  });
+  await expect(channelChip).toBeVisible();
+  const geometry = await channelChip.evaluate((element) => {
+    const textNode = element.firstChild;
+    if (!(textNode instanceof Text)) {
+      throw new Error("Channel chip is missing its decorated text node");
+    }
+    const textRange = document.createRange();
+    textRange.selectNodeContents(textNode);
+    const rects = (source: DOMRectList) =>
+      Array.from(source, (rect) => ({
+        left: rect.left,
+        top: rect.top,
+      }));
+    const style = getComputedStyle(element);
+    const iconStyle = getComputedStyle(element, "::before");
+    return {
+      chipRects: rects(element.getClientRects()),
+      iconPosition: iconStyle.position,
+      iconTransform: iconStyle.transform,
+      paddingInline: Number.parseFloat(style.paddingLeft),
+      textRects: rects(textRange.getClientRects()),
+    };
+  });
+  expect(geometry.chipRects).toHaveLength(2);
+  expect(geometry.textRects).toHaveLength(2);
+  expect(geometry.iconPosition).toBe("static");
+  expect(geometry.iconTransform).toBe("none");
+  expect(
+    geometry.textRects[0].left - geometry.chipRects[0].left,
+  ).toBeGreaterThan(geometry.paddingInline);
+  expect(geometry.textRects[1].left - geometry.chipRects[1].left).toBeCloseTo(
+    geometry.paddingInline,
+    0,
+  );
+});
+
 test("channel references keep caret movement through the channel name", async ({
   page,
 }) => {
