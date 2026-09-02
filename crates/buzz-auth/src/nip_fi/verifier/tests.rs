@@ -209,6 +209,26 @@ fn mint_signed_by(pkcs8_pem: &str, typ: Option<&str>, kid: &str, mut claims: Val
     jsonwebtoken::encode(&header, &claims, &key).expect("sign")
 }
 
+/// Mint a valid, signed token that deliberately omits `nostr_pubkey`.  Used
+/// only to exercise the unconditional missing-claim rejection path; the normal
+/// `mint`/`mint_signed_by` helpers always inject the claim via `or_insert` so
+/// they cannot produce an absent-claim token.
+fn mint_no_pubkey(typ: Option<&str>, kid: &str, mut claims: Value) -> String {
+    {
+        let obj = claims.as_object_mut().expect("claims object");
+        obj.entry("iss").or_insert(json!(ISSUER));
+        obj.entry("aud").or_insert(json!(AUDIENCE));
+        obj.entry("iat").or_insert(json!(now()));
+        obj.entry("exp").or_insert(json!(now() + 600));
+        // Intentionally does NOT inject nostr_pubkey.
+    }
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(kid.to_owned());
+    header.typ = typ.map(str::to_owned);
+    let key = EncodingKey::from_ec_pem(TEST_EC_PKCS8_PEM.as_bytes()).expect("valid EC PEM");
+    jsonwebtoken::encode(&header, &claims, &key).expect("sign")
+}
+
 /// A resource-owner `at+jwt` claim set: valid subject-class marker plus client_id.
 fn resource_owner_claims() -> Value {
     json!({ "sub": "user-123", "client_id": "app-1", "sub_type": "user" })
@@ -694,6 +714,25 @@ fn uppercase_nostr_pubkey_denies() {
         Some("at+jwt"),
         TEST_KID,
         json!({ "sub": "u", "client_id": "a", "sub_type": "user", NOSTR_PUBKEY_CLAIM: upper }),
+    );
+    assert_eq!(
+        verifier.verify(&token).unwrap_err(),
+        VerifierError::ClaimRejected
+    );
+}
+
+#[test]
+fn absent_nostr_pubkey_claim_denies() {
+    // `nostr_pubkey` absence must unconditionally reject — NIP-FI v2 dropped
+    // the per-issuer `require_attested_key` knob that previously made it
+    // optional.  This is a direct falsifiable regression test: removing the
+    // `None => Err(VerifierError::ClaimRejected)` arm from
+    // `parse_nostr_pubkey_claim` must turn this test red.
+    let verifier = verifier_with(access_token_policy());
+    let token = mint_no_pubkey(
+        Some("at+jwt"),
+        TEST_KID,
+        json!({ "sub": "u", "client_id": "a", "sub_type": "user" }),
     );
     assert_eq!(
         verifier.verify(&token).unwrap_err(),

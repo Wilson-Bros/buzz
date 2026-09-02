@@ -69,7 +69,11 @@ pub(crate) const MAX_JWKS_KEYS: usize = 64;
 /// semantics** so prepared evidence built against an older contract is
 /// invalidated. Per-policy fields (issuer, class, bounds, …) are hashed
 /// separately and need no bump.
-pub(crate) const VERIFIER_CONTRACT_VERSION: u32 = 1;
+///
+/// v2 (PR #7221): `nostr_pubkey` absence now unconditionally rejects — the
+/// per-issuer `require_attested_key` knob is removed and the NIP-FI v2 spec
+/// requirement is always enforced.
+pub(crate) const VERIFIER_CONTRACT_VERSION: u32 = 2;
 
 /// The transport-contract fingerprint folded into [`TransportContractId`].
 /// **Bump on any change** to the client-attached parsing, attachment,
