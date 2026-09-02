@@ -6,12 +6,12 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         bestie_assignment::{
-            cache_channel_if_current, clear_assignment, get_assignment, replace_assignment,
+            assignment_matches, clear_assignment, get_assignment, replace_assignment,
             BestieAssignment,
         },
         load_managed_agents,
         retention::{active_retention_scope, open_retention_db, RetentionScope},
-        BackendKind,
+        BackendKind, ManagedAgentRecord,
     },
     models::ChannelInfo,
 };
@@ -51,16 +51,11 @@ fn validate_agent_pubkey(pubkey: &str) -> Result<String, String> {
 }
 
 fn require_eligible_local_agent(
-    app: &AppHandle,
-    state: &AppState,
+    records: &[ManagedAgentRecord],
     pubkey: &str,
 ) -> Result<(), String> {
-    let _store_guard = state
-        .managed_agents_store_lock
-        .lock()
-        .map_err(|error| error.to_string())?;
-    let record = load_managed_agents(app)?
-        .into_iter()
+    let record = records
+        .iter()
         .find(|record| record.pubkey.eq_ignore_ascii_case(pubkey))
         .ok_or_else(|| "assigned Bestie agent no longer exists on this device".to_string())?;
     if record.backend != BackendKind::Local {
@@ -101,7 +96,12 @@ pub fn assign_bestie(
         expected_relay_url.as_deref(),
         expected_signer_pubkey.as_deref(),
     )?;
-    require_eligible_local_agent(&app, &state, &pubkey)?;
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let records = load_managed_agents(&app)?;
+    require_eligible_local_agent(&records, &pubkey)?;
     let mut conn = open_retention_db(&scope.db_path)?;
     replace_assignment(&mut conn, &pubkey)
 }
@@ -145,13 +145,8 @@ pub async fn resolve_bestie_conversation(
         let conn = open_retention_db(&scope.db_path)?;
         let assignment = get_assignment(&conn)?
             .ok_or_else(|| "choose an agent before opening Bestie".to_string())?;
-        let record = load_managed_agents(&app)?
-            .into_iter()
-            .find(|record| record.pubkey.eq_ignore_ascii_case(&assignment.agent_pubkey))
-            .ok_or_else(|| "assigned Bestie agent no longer exists on this device".to_string())?;
-        if record.backend != BackendKind::Local {
-            return Err("assigned Bestie agent is not available as a local agent".to_string());
-        }
+        let records = load_managed_agents(&app)?;
+        require_eligible_local_agent(&records, &assignment.agent_pubkey)?;
         assignment
     };
 
@@ -170,7 +165,7 @@ pub async fn resolve_bestie_conversation(
     let current_scope = active_retention_scope(&app, &state)?;
     assert_expected_scope(&current_scope, Some(&scope.relay_url), Some(&owner_pubkey))?;
     let conn = open_retention_db(&scope.db_path)?;
-    if !cache_channel_if_current(&conn, &assignment.agent_pubkey, &channel.id)? {
+    if !assignment_matches(&conn, &assignment.agent_pubkey)? {
         return Err("Bestie assignment changed while opening the conversation".to_string());
     }
     Ok(channel)

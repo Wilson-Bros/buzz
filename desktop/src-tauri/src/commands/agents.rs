@@ -6,14 +6,15 @@ use super::managed_agent_definition::validate_create_definition;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        build_managed_agent_summary, current_instance_id, ensure_persona_is_active,
-        find_managed_agent_mut, load_managed_agents, load_personas, load_teams,
-        managed_agent_avatar_url, normalize_agent_args, resolve_provider_binary,
-        save_managed_agents, start_managed_agent_process, stop_managed_agent_process,
-        stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
-        validate_provider_config, BackendKind, CreateManagedAgentRequest,
-        CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
-        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        bestie_assignment::clear_agent_assignments, build_managed_agent_summary,
+        current_instance_id, ensure_persona_is_active, find_managed_agent_mut, load_managed_agents,
+        load_personas, load_teams, managed_agent_avatar_url, managed_agents_base_dir,
+        normalize_agent_args, resolve_provider_binary, save_managed_agents,
+        start_managed_agent_process, stop_managed_agent_process, stop_managed_agent_workspace_pair,
+        sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
+        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentRecord,
+        ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
+        DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::relay_ws_url_with_override,
     util::now_iso,
@@ -1135,15 +1136,15 @@ pub async fn delete_managed_agent(
                 }
             }
 
+            if !records.iter().any(|record| record.pubkey == pubkey) {
+                return Err(format!("agent {pubkey} not found"));
+            }
+            clear_agent_assignments(&managed_agents_base_dir(&app)?, &pubkey)?;
             if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
                 stop_managed_agent_process(&app, record, &mut runtimes)?;
             }
             state.clear_agent_session_caches(&pubkey);
-            let initial_len = records.len();
             records.retain(|record| record.pubkey != pubkey);
-            if records.len() == initial_len {
-                return Err(format!("agent {pubkey} not found"));
-            }
             save_managed_agents(&app, &records)?;
             crate::managed_agents::delete_agent_key(&pubkey);
             // Tombstone after confirmed removal (inside lock; every published

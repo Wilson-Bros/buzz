@@ -1,13 +1,14 @@
 import { Star } from "lucide-react";
 
 import type { ManagedAgent } from "@/shared/api/types";
-import { useBestie } from "./useBestie";
 
-export function BestieCardBadge({ agent }: { agent: ManagedAgent }) {
-  const bestie = useBestie();
-  const isBestie =
-    bestie.assignment?.agentPubkey.toLowerCase() === agent.pubkey.toLowerCase();
-
+export function BestieCardBadge({
+  agent,
+  isBestie,
+}: {
+  agent: ManagedAgent;
+  isBestie: boolean;
+}) {
   if (!isBestie) return null;
 
   return (

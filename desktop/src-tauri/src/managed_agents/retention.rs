@@ -48,9 +48,8 @@ pub fn scope_for_arrival(scope: RetentionScope, arrival_relay_url: &str) -> Opti
 
 /// Relay-URL form that identifies a retention scope: equivalent workspace URLs
 /// (surrounding space, trailing slash) must resolve to one scope.
-fn normalized_relay_scope(relay_url: &str) -> String {
-    buzz_core_pkg::relay::normalize_relay_url(relay_url)
-        .unwrap_or_else(|_| relay_url.trim().trim_end_matches('/').to_string())
+fn normalized_relay_scope(relay_url: &str) -> &str {
+    relay_url.trim().trim_end_matches('/')
 }
 
 /// Resolve the retention database path for a relay + owner pair.

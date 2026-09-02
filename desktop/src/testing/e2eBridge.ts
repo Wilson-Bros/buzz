@@ -3228,7 +3228,6 @@ let mockManagedAgents: MockManagedAgent[] = [];
 let mockManagedAgentRuntimes: MockManagedAgentRuntimeRow[] = [];
 let mockBestieAssignment: {
   agent_pubkey: string;
-  canonical_channel_id: string | null;
 } | null = null;
 
 // Mutable `save_subscriptions` table mirror — TEST-ONLY.
@@ -9699,6 +9698,9 @@ async function handleDeleteManagedAgent(args: {
   mockManagedAgents = mockManagedAgents.filter(
     (candidate) => candidate.pubkey !== args.pubkey,
   );
+  if (mockBestieAssignment?.agent_pubkey === args.pubkey) {
+    mockBestieAssignment = null;
+  }
   syncMockRelayAgentsFromManagedAgents();
 }
 
@@ -13749,10 +13751,6 @@ export function maybeInstallE2eTauriMocks() {
         }
         mockBestieAssignment = {
           agent_pubkey: agent.pubkey,
-          canonical_channel_id:
-            mockBestieAssignment?.agent_pubkey === agent.pubkey
-              ? mockBestieAssignment.canonical_channel_id
-              : null,
         };
         return { ...mockBestieAssignment };
       }
@@ -13767,7 +13765,6 @@ export function maybeInstallE2eTauriMocks() {
           { pubkeys: [mockBestieAssignment.agent_pubkey] },
           activeConfig,
         );
-        mockBestieAssignment.canonical_channel_id = channel.id;
         return channel;
       }
       case "start_managed_agent_runtime":

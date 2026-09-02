@@ -28,6 +28,7 @@ import {
   resolveBestieConversation,
   type BestieScope,
 } from "./api";
+import { findAssignedLocalAgent } from "./findAssignedLocalAgent";
 
 export function bestieAssignmentQueryKey(
   relayUrl: string,
@@ -40,9 +41,7 @@ export function bestieAssignmentQueryKey(
   ] as const;
 }
 
-export function useBestie() {
-  const queryClient = useQueryClient();
-  const { goChannel } = useAppNavigation();
+export function useBestieAssignmentQuery(enabled = true) {
   const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
   const relayUrl = activeCommunity?.relayUrl ?? "";
@@ -56,23 +55,31 @@ export function useBestie() {
       : null;
   const queryKey = bestieAssignmentQueryKey(relayUrl, ownerPubkey);
   const assignmentQuery = useQuery({
-    enabled: scope !== null,
+    enabled: enabled && scope !== null,
     queryKey,
-    queryFn: () => getBestieAssignment(scope as BestieScope),
+    queryFn: () => {
+      if (!scope) return null;
+      return getBestieAssignment(scope);
+    },
   });
+
+  return { assignmentQuery, ownerPubkey, queryKey, relayUrl, scope };
+}
+
+export function useBestie() {
+  const queryClient = useQueryClient();
+  const { goChannel } = useAppNavigation();
+  const { assignmentQuery, ownerPubkey, queryKey, relayUrl, scope } =
+    useBestieAssignmentQuery();
   const managedAgentsQuery = useManagedAgentsQuery({ enabled: scope !== null });
   const runtimesQuery = useManagedAgentRuntimesQuery({
     enabled: scope !== null,
   });
   const runtimeAction = useManagedAgentRuntimeAction();
-  const eligibleAgents = (managedAgentsQuery.data ?? []).filter(
-    (agent) => agent.backend.type === "local",
+  const assignedAgent = findAssignedLocalAgent(
+    managedAgentsQuery.data ?? [],
+    assignmentQuery.data,
   );
-  const assignedAgent = assignmentQuery.data
-    ? (eligibleAgents.find(
-        (agent) => agent.pubkey === assignmentQuery.data?.agentPubkey,
-      ) ?? null)
-    : null;
   const presenceQuery = usePresenceQuery(
     assignedAgent ? [assignedAgent.pubkey] : [],
     { enabled: assignedAgent !== null },

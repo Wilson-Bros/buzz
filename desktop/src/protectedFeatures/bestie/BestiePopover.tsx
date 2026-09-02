@@ -14,6 +14,7 @@ import { buildMainTimelineEntries } from "@/features/messages/lib/threadPanel";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import type { TimelineMessage } from "@/features/messages/types";
 import { TimelineMessageList } from "@/features/messages/ui/TimelineMessageList";
+import { ProtectedMessageActionsBoundary } from "@protected-feature-components";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { useProfileQuery } from "@/features/profile/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
@@ -174,18 +175,19 @@ function BestieConversationTranscript({
       data-testid="bestie-mini-transcript"
       ref={transcriptRef}
     >
-      <TimelineMessageList
-        channelId={channel.id}
-        channelName={channel.name}
-        channelType={channel.channelType}
-        currentPubkey={currentPubkey}
-        mainEntries={mainTimelineEntries}
-        messages={messages}
-        onToggleReaction={onToggleReaction}
-        profiles={profiles}
-        showProtectedMessageAction={false}
-        stickyDayDividers={false}
-      />
+      <ProtectedMessageActionsBoundary>
+        <TimelineMessageList
+          channelId={channel.id}
+          channelName={channel.name}
+          channelType={channel.channelType}
+          currentPubkey={currentPubkey}
+          mainEntries={mainTimelineEntries}
+          messages={messages}
+          onToggleReaction={onToggleReaction}
+          profiles={profiles}
+          stickyDayDividers={false}
+        />
+      </ProtectedMessageActionsBoundary>
     </div>
   );
 }

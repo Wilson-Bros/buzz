@@ -16,7 +16,10 @@ import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
 import { Badge } from "@/shared/ui/badge";
-import { ProtectedBestieCardBadge } from "@protected-feature-components";
+import {
+  ProtectedBestieCardBadge,
+  useProtectedBestiePubkey,
+} from "@protected-feature-components";
 import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
@@ -98,6 +101,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
   } = props;
 
   const isArchived = useIsArchivedPredicate();
+  const bestiePubkey = useProtectedBestiePubkey(agents)?.toLowerCase() ?? null;
   const { groups, ungrouped, unknown } = React.useMemo(
     () => buildUnifiedGroups(personas, agents, isArchived),
     [personas, agents, isArchived],
@@ -155,6 +159,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                   )}
                   agent={profileAgent}
                   defaultModel={defaultModel}
+                  isBestie={profileAgent?.pubkey.toLowerCase() === bestiePubkey}
                   key={group.persona.id}
                   persona={group.persona}
                   restartingAgentPubkey={restartingAgentPubkey}
@@ -176,6 +181,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               collapsed={collapsed}
               defaultModel={defaultModel}
               groupKey="__unknown__"
+              bestiePubkey={bestiePubkey}
               label="Unknown agents"
               restartingAgentPubkey={restartingAgentPubkey}
               startingAgentPubkey={startingAgentPubkey}
@@ -191,6 +197,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               collapsed={collapsed}
               defaultModel={defaultModel}
               groupKey="__ungrouped__"
+              bestiePubkey={bestiePubkey}
               label="Custom agents"
               restartingAgentPubkey={restartingAgentPubkey}
               startingAgentPubkey={startingAgentPubkey}
@@ -225,6 +232,7 @@ function AgentPersonaCard({
   actions,
   agent,
   defaultModel,
+  isBestie,
   persona,
   restartingAgentPubkey,
   startingAgentPubkey,
@@ -241,6 +249,7 @@ function AgentPersonaCard({
   ) => React.ReactNode;
   agent: ManagedAgent | undefined;
   defaultModel: string;
+  isBestie: boolean;
   persona: AgentPersona;
   restartingAgentPubkey: string | null;
   startingAgentPubkey: string | null;
@@ -318,7 +327,9 @@ function AgentPersonaCard({
       avatarUrl={avatarUrl}
       dataTestId={`persona-agent-row-${persona.id}`}
       footerAccessory={
-        agent ? <ProtectedBestieCardBadge agent={agent} /> : null
+        agent ? (
+          <ProtectedBestieCardBadge agent={agent} isBestie={isBestie} />
+        ) : null
       }
       label={title}
       subtitle={subtitle}
@@ -348,6 +359,7 @@ function AgentPersonaCard({
 
 function StandaloneAgentCard({
   agent,
+  isBestie,
   defaultModel,
   restartingAgentPubkey,
   startingAgentPubkey,
@@ -356,6 +368,7 @@ function StandaloneAgentCard({
   onStartAgent,
 }: {
   agent: ManagedAgent;
+  isBestie: boolean;
   defaultModel: string;
   restartingAgentPubkey: string | null;
   startingAgentPubkey: string | null;
@@ -402,7 +415,9 @@ function StandaloneAgentCard({
       }
       avatarUrl={profileQuery.data?.avatarUrl}
       dataTestId={`managed-agent-${agent.pubkey}`}
-      footerAccessory={<ProtectedBestieCardBadge agent={agent} />}
+      footerAccessory={
+        <ProtectedBestieCardBadge agent={agent} isBestie={isBestie} />
+      }
       label={title}
       subtitle={
         // Definition-less instance: no authored description exists, so fall
@@ -455,6 +470,7 @@ function CollapsibleAgentGroup({
   groupKey,
   label,
   agents,
+  bestiePubkey,
   collapsed,
   defaultModel,
   restartingAgentPubkey,
@@ -467,6 +483,7 @@ function CollapsibleAgentGroup({
   groupKey: string;
   label: string;
   agents: ManagedAgent[];
+  bestiePubkey: string | null;
   collapsed: ReadonlySet<string>;
   defaultModel: string;
   restartingAgentPubkey: string | null;
@@ -501,6 +518,7 @@ function CollapsibleAgentGroup({
             <StandaloneAgentCard
               agent={agent}
               defaultModel={defaultModel}
+              isBestie={agent.pubkey.toLowerCase() === bestiePubkey}
               key={agent.pubkey}
               restartingAgentPubkey={restartingAgentPubkey}
               startingAgentPubkey={startingAgentPubkey}

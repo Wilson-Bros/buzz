@@ -98,8 +98,6 @@ type TimelineMessageListProps = {
   searchMatchingMessageIds?: Set<string>;
   /** The current find-in-channel query string. */
   searchQuery?: string;
-  /** Whether protected product actions appear in each message toolbar. */
-  showProtectedMessageAction?: boolean;
   /** Keep date chips pinned while the timeline scrolls. */
   stickyDayDividers?: boolean;
   /** Per-thread unread counts keyed by thread root id. */
@@ -158,7 +156,6 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
   searchActiveMessageId = null,
   searchMatchingMessageIds,
   searchQuery,
-  showProtectedMessageAction = true,
   stickyDayDividers = true,
   threadUnreadCounts,
   unfollowThreadById,
@@ -281,7 +278,6 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
               searchActiveMessageId={searchActiveMessageId}
               searchMatchingMessageIds={searchMatchingMessageIds}
               searchQuery={searchQuery}
-              showProtectedMessageAction={showProtectedMessageAction}
               threadUnreadCounts={threadUnreadCounts}
               unfollowThreadById={unfollowThreadById}
               videoReviewContext={videoReviewContextById.get(
@@ -317,7 +313,6 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
       searchActiveMessageId,
       searchMatchingMessageIds,
       searchQuery,
-      showProtectedMessageAction,
       threadUnreadCounts,
       unfollowThreadById,
       videoReviewContextById,

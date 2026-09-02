@@ -108,7 +108,6 @@ export const MessageRow = React.memo(
     profiles,
     searchQuery,
     showDepthGuides = true,
-    showProtectedMessageAction = true,
     videoReviewCommentRootId,
     videoReviewContext,
   }: {
@@ -160,7 +159,6 @@ export const MessageRow = React.memo(
     profiles?: UserProfileLookup;
     searchQuery?: string;
     showDepthGuides?: boolean;
-    showProtectedMessageAction?: boolean;
     videoReviewCommentRootId?: string;
     videoReviewContext?: VideoReviewContext;
   }) {
@@ -598,7 +596,6 @@ export const MessageRow = React.memo(
           onUnfollowThread={onUnfollowThread}
           reactionErrorMessage={reactionErrorMessage}
           reactions={reactions}
-          showProtectedMessageAction={showProtectedMessageAction}
         />
       </div>
     );
@@ -993,7 +990,6 @@ export const MessageRow = React.memo(
     prev.onSendToChannel === next.onSendToChannel &&
     prev.profiles === next.profiles &&
     prev.searchQuery === next.searchQuery &&
-    prev.showProtectedMessageAction === next.showProtectedMessageAction &&
     prev.videoReviewCommentRootId === next.videoReviewCommentRootId &&
     prev.videoReviewContext === next.videoReviewContext,
 );

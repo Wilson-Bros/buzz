@@ -4,12 +4,10 @@ import { invokeTauri } from "@/shared/api/tauri";
 
 type RawBestieAssignment = {
   agent_pubkey: string;
-  canonical_channel_id: string | null;
 };
 
 export type BestieAssignment = {
   agentPubkey: string;
-  canonicalChannelId: string | null;
 };
 
 export type BestieScope = {
@@ -20,7 +18,6 @@ export type BestieScope = {
 function fromRawAssignment(assignment: RawBestieAssignment): BestieAssignment {
   return {
     agentPubkey: assignment.agent_pubkey,
-    canonicalChannelId: assignment.canonical_channel_id,
   };
 }
 
