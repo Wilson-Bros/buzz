@@ -184,6 +184,7 @@ pub async fn handle_connection(
     addr: SocketAddr,
     tenant: TenantContext,
     nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
+    connection_time: chrono::DateTime<chrono::Utc>,
 ) {
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
@@ -207,6 +208,7 @@ pub async fn handle_connection(
                 conn_id,
                 control,
                 nip_fi_assertion,
+                connection_time,
             )
         },
     )
@@ -221,12 +223,13 @@ async fn handle_active_connection(
     conn_id: Uuid,
     control: CommunityConnectionControl,
     nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
+    connection_time: chrono::DateTime<chrono::Utc>,
 ) {
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
-    // Capture connection_time before any await so the session partition is
-    // rooted at the true establishment instant. [FI-TRACE-LEASE-BOUND]
-    let connection_time = chrono::Utc::now();
+    // connection_time is threaded in from the HTTP handler (captured immediately
+    // before on_upgrade) so the session partition is rooted at the true upgrade
+    // instant, not the post-community-active-check instant. [FI-TRACE-LEASE-BOUND]
     let permit = match state.conn_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -369,9 +372,14 @@ async fn handle_active_connection(
     // `authorization_denied` on `ctrl_tx` (priority channel, ahead of the Close
     // the send loop emits on cancel), then cancels. No in-band renewal.
     // [FI-TRACE-LEASE-BOUND]
-    let nip_fi_expiry_task = conn
-        .session_deadline
-        .map(|deadline| spawn_nip_fi_expiry_task(Arc::clone(&conn), cancel.clone(), deadline));
+    let nip_fi_expiry_task = conn.session_deadline.map(|deadline| {
+        crate::nip_fi_session::spawn_nip_fi_expiry_task(
+            deadline,
+            conn.ctrl_tx.clone(),
+            cancel.clone(),
+            crate::nip_fi_session::NipFiWsRoute::Root,
+        )
+    });
 
     recv_loop(
         ws_recv,
@@ -421,55 +429,6 @@ async fn handle_active_connection(
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection closed");
 
     drop(permit);
-}
-
-/// Spawn the NIP-FI session-lifetime enforcement task.
-///
-/// Fires at `deadline`, queues `restricted: authorization denied` on `conn.ctrl_tx`
-/// (priority channel, ahead of the Close the send loop emits on cancel), then
-/// cancels. No in-band renewal. [FI-TRACE-LEASE-BOUND]
-///
-/// Both the production path and tests call this constructor — mutations to the
-/// production expiry body redden the tests, mutations to the test cannot hide
-/// the production behavior.
-pub(crate) fn spawn_nip_fi_expiry_task(
-    conn: Arc<ConnectionState>,
-    cancel: CancellationToken,
-    deadline: chrono::DateTime<chrono::Utc>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let now = chrono::Utc::now();
-        // Equality at deadline is expired: use strict less-than to compute
-        // remaining duration. If already expired or equality holds, fire immediately.
-        let remaining = if now < deadline {
-            (deadline - now)
-                .to_std()
-                .unwrap_or(std::time::Duration::ZERO)
-        } else {
-            std::time::Duration::ZERO
-        };
-        tokio::select! {
-            _ = tokio::time::sleep(remaining) => {
-                use buzz_auth::DenialClass;
-                let msg = DenialClass::AuthorizationDenied.nostr_text();
-                // Queue on ctrl_tx BEFORE cancel so the send loop's
-                // cancellation branch drains it ahead of the Close frame.
-                // Mirror the pairing-mismatch path in auth.rs. A full or
-                // closed control channel is terminal — treat as already
-                // disconnected and proceed to cancel regardless.
-                let _ = conn.ctrl_tx.try_send(WsMessage::Text(
-                    crate::protocol::RelayMessage::notice(msg).into(),
-                ));
-                metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
-                warn!(
-                    conn_id = %conn.conn_id,
-                    "NIP-FI session lease expired — closing connection"
-                );
-                cancel.cancel();
-            }
-            _ = cancel.cancelled() => {}
-        }
-    })
 }
 
 ///
@@ -1354,49 +1313,35 @@ pub(crate) mod tests {
     // ── NIP-FI expiry notice delivered on ctrl_tx before cancel ───────────────
     //
     // The expiry task queues `restricted: authorization denied` on `ctrl_tx`
-    // BEFORE cancellation, mirroring the pairing-mismatch path. This test
-    // invokes the production `spawn_nip_fi_expiry_task` constructor: an
-    // already-expired deadline fires immediately; the ctrl channel carries the
-    // notice; the cancel fires afterward.
+    // BEFORE cancellation. This test invokes the production
+    // `nip_fi_session::spawn_nip_fi_expiry_task` constructor (Root route):
+    // an already-expired deadline fires immediately; the ctrl channel carries
+    // the Nostr NOTICE; the cancel fires afterward.
     //
     // Mutation evidence:
-    //   A) Replace `ctrl_tx.try_send` with `send_tx.try_send` in
-    //      `spawn_nip_fi_expiry_task` → `ctrl_rx.try_recv()` returns `Err`,
-    //      test panics at "ctrl channel must contain the notice frame".
-    //   B) Delete the `cancel.cancel()` call → `cancel.is_cancelled()` is
-    //      false, test panics at "expiry task must cancel the connection".
+    //   A) Delete/change the Root enqueue in `spawn_nip_fi_expiry_task` →
+    //      `ctrl_rx.try_recv()` returns `Err`; test panics at "ctrl channel
+    //      must contain the notice frame".
+    //   B) Delete `cancel.cancel()` → `cancel.is_cancelled()` is false; test
+    //      panics at "expiry task must cancel the connection".
 
     #[tokio::test]
     async fn expiry_notice_queued_on_ctrl_before_cancel() {
         use tokio::sync::mpsc;
 
-        let (send_tx, _send_rx) = mpsc::channel(4);
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<WsMessage>(8);
         let cancel = CancellationToken::new();
-        let conn = Arc::new(ConnectionState {
-            conn_id: Uuid::new_v4(),
-            tenant: TenantContext::resolved(
-                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
-                "test.local".to_string(),
-            ),
-            remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
-            auth_state: RwLock::new(AuthState::Pending {
-                challenge: "test-challenge".to_string(),
-            }),
-            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            send_tx,
-            ctrl_tx: ctrl_tx.clone(),
-            cancel: cancel.clone(),
-            backpressure_count: Arc::new(AtomicU8::new(0)),
-            grace_limit: 3,
-            nip_fi_assertion: None,
-            // Already expired deadline → fires immediately.
-            session_deadline: Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
-        });
 
-        // Invoke the production task constructor — not a copy of its body.
-        let deadline = conn.session_deadline.unwrap();
-        let expiry_task = spawn_nip_fi_expiry_task(Arc::clone(&conn), cancel.clone(), deadline);
+        // Already-expired deadline → fires immediately.
+        let deadline = chrono::Utc::now() - chrono::Duration::seconds(10);
+
+        // Invoke the production shared constructor — Root route.
+        let expiry_task = crate::nip_fi_session::spawn_nip_fi_expiry_task(
+            deadline,
+            ctrl_tx,
+            cancel.clone(),
+            crate::nip_fi_session::NipFiWsRoute::Root,
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(2), expiry_task)
             .await

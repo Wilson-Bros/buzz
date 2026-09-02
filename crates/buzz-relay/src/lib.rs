@@ -8,6 +8,7 @@ mod rejection;
 
 /// NIP-FI relay-level configuration (issuer set, session lifetime, JWKS warm).
 pub mod nip_fi_config;
+pub(crate) mod nip_fi_session;
 /// NIP-FI assertion validation at WebSocket upgrade.
 pub(crate) mod nip_fi_upgrade;
 

@@ -18,30 +18,6 @@ use crate::connection::{AuthState, ConnectionState};
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 
-/// Check the NIP-FI key-pairing invariant [FI-INV-05].
-///
-/// When a federated identity assertion was presented at upgrade, the proven
-/// NIP-42 key must equal the `nostr_pubkey` claim. A claimless assertion
-/// (no `nostr_pubkey`) is also a denial — defense in depth.
-///
-/// Returns `Ok(())` when the pairing passes or there is no assertion.
-/// Returns `Err(DenialClass::AuthorizationDenied)` on mismatch or claimless assertion.
-///
-/// The caller is responsible for delivering the denial frame on the control
-/// channel and cancelling the connection.
-pub(crate) fn check_nip_fi_key_pairing(
-    assertion: Option<&buzz_auth::VerifiedAssertion>,
-    proven_pubkey: nostr::PublicKey,
-) -> Result<(), buzz_auth::DenialClass> {
-    let Some(assertion) = assertion else {
-        return Ok(()); // no assertion present — off-mode or pre-pairing
-    };
-    match assertion.asserted_key() {
-        Some(asserted_key) if asserted_key == proven_pubkey => Ok(()),
-        _ => Err(buzz_auth::DenialClass::AuthorizationDenied),
-    }
-}
-
 /// Extract a NIP-OA `auth` tag from a verified AUTH event and serialize it as
 /// the JSON-array string that [`buzz_sdk::nip_oa::verify_auth_tag`] expects.
 ///
@@ -116,13 +92,29 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         Ok(mut auth_ctx) => {
             let pubkey = auth_ctx.pubkey;
 
-            // Community ban gate (NIP-42 seam). Runs immediately after auth
-            // verification succeeds and before the allowlist and relay-membership
-            // gates, per COMMUNITY_MODERATION_PLAN.md §0 decision 4 and the
-            // MOD-7/M20 invariant (a ban must block connection auth even for open
-            // channels — enforcement is structural, not filtered later). A banned
-            // principal gets the standard protocol denial and the connection is
-            // dropped with zero further processing.
+            // NIP-FI key pairing [FI-INV-05]: immediately after successful
+            // verify_auth_event, before community-ban/allowlist/membership gates.
+            // Pre-DB positioning means a denied caller pays zero DB cost and the
+            // production call site is falsifiable without live tenant policy.
+            // [FI-TRACE-DENIAL-ORACLE post-establishment]
+            if crate::nip_fi_session::enforce_nip_fi_key_pairing(
+                conn.nip_fi_assertion.as_ref(),
+                pubkey,
+                crate::nip_fi_session::PairingDenialTarget::Root(conn.as_ref()),
+            )
+            .await
+                == crate::nip_fi_session::PairingOutcome::Denied
+            {
+                return;
+            }
+
+            // Community ban gate (NIP-42 seam). Runs after NIP-FI pairing and
+            // before the allowlist and relay-membership gates, per
+            // COMMUNITY_MODERATION_PLAN.md §0 decision 4 and the MOD-7/M20
+            // invariant (a ban must block connection auth even for open channels —
+            // enforcement is structural, not filtered later). A banned principal
+            // gets the standard protocol denial and the connection is dropped with
+            // zero further processing.
             //
             // NIP-OA cascade: a ban on the authenticated pubkey blocks it directly;
             // a ban on its cryptographically-proven owner cascades to the agent
@@ -207,40 +199,6 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     conn.cancel.cancel();
                     return;
                 }
-            }
-
-            // NIP-FI key pairing [FI-INV-05]: when a federated identity assertion
-            // was presented at upgrade and contains a `nostr_pubkey` claim, the
-            // proven NIP-42 key must equal that claim. This check is unconditional —
-            // no per-issuer flag reads (S2 deletes `require_attested_key`; S3
-            // enforces the invariant structurally).
-            //
-            // Defense in depth: a None asserted_key means the assertion reached
-            // the relay without `nostr_pubkey` (should not happen since S3 forces
-            // require_attested_key=true, but treat as denial regardless).
-            //
-            // Mismatch: send `restricted: authorization denied` on the control
-            // channel (priority delivery ahead of Close), cancel, return.
-            // [FI-TRACE-DENIAL-ORACLE post-establishment]
-            if let Err(_) = check_nip_fi_key_pairing(conn.nip_fi_assertion.as_ref(), pubkey) {
-                warn!(
-                    conn_id = %conn_id,
-                    proven_pubkey = %pubkey.to_hex(),
-                    asserted_pubkey = ?conn.nip_fi_assertion.as_ref().and_then(|a| a.asserted_key()).map(|k| k.to_hex()),
-                    "NIP-FI key pairing mismatch — closing connection"
-                );
-                metrics::counter!(
-                    "buzz_auth_failures_total",
-                    "reason" => "nip_fi_key_mismatch"
-                )
-                .increment(1);
-                *conn.auth_state.write().await = AuthState::Failed;
-                use buzz_auth::DenialClass;
-                let _ = conn.ctrl_tx.try_send(WsMessage::Text(
-                    RelayMessage::notice(DenialClass::AuthorizationDenied.nostr_text()).into(),
-                ));
-                conn.cancel.cancel();
-                return;
             }
 
             // Pubkey allowlist gate — only for pubkey-only auth.
@@ -358,8 +316,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 
 #[cfg(test)]
 mod tests {
-    use super::check_nip_fi_key_pairing;
-    use super::extract_auth_tag_json;
+    use super::{extract_auth_tag_json, handle_auth};
+    use crate::connection::AuthState;
     use axum::extract::ws::Message as WsMessage;
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
@@ -412,229 +370,132 @@ mod tests {
         assert_eq!(extract_auth_tag_json(&event), None);
     }
 
-    // ── NIP-FI pairing — production function falsifiability ───────────────────
+    // ── Witness A: Root pairing mismatch through the real root denial path ────
     //
-    // These tests call `check_nip_fi_key_pairing` (the shared production
-    // function invoked by BOTH `handlers/auth.rs` and `audio/handler.rs`).
-    // Mutating or deleting `check_nip_fi_key_pairing` turns these red; mutating
-    // a single call site while leaving the shared fn intact also turns them red
-    // because both ingresses are driven (see built-router tests in router.rs).
+    // Drives the production `handle_auth`, NOT the shared function alone.
+    // The NIP-FI pairing call site is pre-DB: it fires immediately after
+    // `verify_auth_event` succeeds, before any community-ban/allowlist/membership
+    // DB gate. A lazy DB pool suffices — the test returns before any DB read.
     //
     // Mutation evidence:
-    //   A) Delete `check_nip_fi_key_pairing` → compile error at both call sites.
-    //   B) Change the Err branch to Ok → pairing_mismatch_* tests panic at the
-    //      `assert!(result.is_err())` assertion.
-    //   C) Change the None branch to Ok → claimless_* test panics.
+    //   - Delete the production call from `handle_auth` → no Denied; test panics
+    //     on AuthState (not Failed) or ctrl frame (absent) assertions.
+    //   - Delete the denial branch inside `enforce_nip_fi_key_pairing` → same.
+    //   - Emit on send_tx instead of ctrl_tx → ctrl frame assertion panics.
+    //   - Omit `AuthState::Failed` → auth_state assertion panics.
+    //   - Omit `cancel.cancel()` → cancellation assertion panics.
 
-    #[test]
-    fn pairing_mismatch_returns_authorization_denied_err() {
+    async fn auth_test_state() -> std::sync::Arc<crate::state::AppState> {
+        use std::sync::Arc;
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn handle_auth_pairing_mismatch_runs_full_root_denial_path() {
         use buzz_auth::VerifiedAssertion;
         use chrono::{Duration, Utc};
-        use nostr::Keys;
-
-        let asserted_keys = Keys::generate();
-        let proven_keys = Keys::generate();
-        let assertion = VerifiedAssertion::for_test(
-            Some(asserted_keys.public_key()),
-            vec![Utc::now() + Duration::hours(1)],
-        );
-        let result = check_nip_fi_key_pairing(Some(&assertion), proven_keys.public_key());
-        assert!(
-            result.is_err(),
-            "mismatched keys must return Err (authorization denied)"
-        );
-        assert_eq!(
-            result.unwrap_err(),
-            buzz_auth::DenialClass::AuthorizationDenied,
-            "denial class must be AuthorizationDenied"
-        );
-    }
-
-    #[test]
-    fn claimless_assertion_returns_authorization_denied_err() {
-        use buzz_auth::VerifiedAssertion;
-        use chrono::{Duration, Utc};
-        use nostr::Keys;
-
-        let proven_keys = Keys::generate();
-        // No nostr_pubkey claim in the assertion.
-        let assertion = VerifiedAssertion::for_test(None, vec![Utc::now() + Duration::hours(1)]);
-        let result = check_nip_fi_key_pairing(Some(&assertion), proven_keys.public_key());
-        assert!(
-            result.is_err(),
-            "claimless assertion must return Err (authorization denied)"
-        );
-        assert_eq!(
-            result.unwrap_err(),
-            buzz_auth::DenialClass::AuthorizationDenied,
-            "claimless denial class must be AuthorizationDenied"
-        );
-    }
-
-    #[test]
-    fn matching_keys_returns_ok() {
-        use buzz_auth::VerifiedAssertion;
-        use chrono::{Duration, Utc};
-        use nostr::Keys;
-
-        let keys = Keys::generate();
-        let assertion = VerifiedAssertion::for_test(
-            Some(keys.public_key()),
-            vec![Utc::now() + Duration::hours(1)],
-        );
-        let result = check_nip_fi_key_pairing(Some(&assertion), keys.public_key());
-        assert!(result.is_ok(), "matching keys must return Ok");
-    }
-
-    #[test]
-    fn no_assertion_always_passes() {
-        use nostr::Keys;
-        let keys = Keys::generate();
-        let result = check_nip_fi_key_pairing(None, keys.public_key());
-        assert!(result.is_ok(), "absent assertion must return Ok (off mode)");
-    }
-
-    // ── Denial frame delivery on ctrl_tx — integration with ConnectionState ───
-    //
-    // Verify that the production call site in handle_auth delivers the denial
-    // frame on ctrl (not data) when check_nip_fi_key_pairing returns Err.
-    // This test drives build_conn_with_assertion + the production call path:
-    // mutating the ctrl_tx.try_send call to use send_tx turns it red.
-
-    fn build_conn_with_assertion(
-        assertion: buzz_auth::VerifiedAssertion,
-        proven_pubkey: nostr::PublicKey,
-    ) -> (
-        std::sync::Arc<crate::connection::ConnectionState>,
-        tokio::sync::mpsc::Receiver<axum::extract::ws::Message>,
-        tokio::sync::mpsc::Receiver<axum::extract::ws::Message>,
-    ) {
-        use crate::connection::ConnectionState;
-        use crate::handlers::auth::AuthState;
-        use buzz_auth::AuthMethod;
         use std::collections::HashMap;
         use std::sync::Arc;
         use tokio::sync::{mpsc, RwLock};
         use tokio_util::sync::CancellationToken;
         use uuid::Uuid;
 
-        let (send_tx, send_rx) = mpsc::channel(8);
-        let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        // Key A named in assertion; key B signs the NIP-42 event — mismatch.
+        let key_a = Keys::generate();
+        let key_b = Keys::generate();
+
+        let assertion = VerifiedAssertion::for_test(
+            Some(key_a.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+
+        let challenge = "test-challenge-A".to_string();
+        let (send_tx, mut send_rx) = mpsc::channel::<WsMessage>(8);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<WsMessage>(8);
         let cancel = CancellationToken::new();
-        let auth = buzz_auth::AuthContext {
-            pubkey: proven_pubkey,
-            scopes: vec![],
-            channel_ids: None,
-            auth_method: AuthMethod::Nip42,
-            agent_owner_pubkey: None,
-        };
-        let conn = ConnectionState {
+
+        let conn = Arc::new(crate::connection::ConnectionState {
             conn_id: Uuid::new_v4(),
             tenant: buzz_core::tenant::TenantContext::resolved(
                 buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
                 "test.local".to_string(),
             ),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
-            auth_state: RwLock::new(AuthState::Authenticated(auth)),
+            auth_state: RwLock::new(AuthState::Pending {
+                challenge: challenge.clone(),
+            }),
             subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             send_tx,
             ctrl_tx,
-            cancel,
+            cancel: cancel.clone(),
             backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             grace_limit: 3,
             nip_fi_assertion: Some(assertion),
             session_deadline: None,
-        };
-        (Arc::new(conn), send_rx, ctrl_rx)
-    }
+        });
 
-    #[tokio::test]
-    async fn pairing_mismatch_delivers_denial_on_ctrl_not_data() {
-        use buzz_auth::VerifiedAssertion;
-        use chrono::{Duration, Utc};
-        use nostr::Keys;
+        let state = auth_test_state().await;
 
-        let asserted_keys = Keys::generate();
-        let proven_keys = Keys::generate();
-        let assertion = VerifiedAssertion::for_test(
-            Some(asserted_keys.public_key()),
-            vec![Utc::now() + Duration::hours(1)],
-        );
-        let (conn, mut send_rx, mut ctrl_rx) =
-            build_conn_with_assertion(assertion, proven_keys.public_key());
+        // relay_url = ws://<tenant.host()> where scheme prefix is from config
+        // (default ws://), and host is "test.local".
+        let relay_url = "ws://test.local";
+        let auth_event = EventBuilder::new(Kind::Authentication, "")
+            .tag(Tag::parse(["relay", relay_url]).unwrap())
+            .tag(Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(&key_b)
+            .unwrap();
 
-        // Invoke the production pairing function. On mismatch, deliver the
-        // denial on ctrl_tx and cancel — exactly as handle_auth does.
-        if let Err(denial) =
-            check_nip_fi_key_pairing(conn.nip_fi_assertion.as_ref(), proven_keys.public_key())
-        {
-            let _ = conn.ctrl_tx.try_send(WsMessage::Text(
-                crate::protocol::RelayMessage::notice(denial.nostr_text()).into(),
-            ));
-            conn.cancel.cancel();
-        }
+        // Drive the production handle_auth path.
+        handle_auth(auth_event, Arc::clone(&conn), state).await;
 
         assert!(
-            conn.cancel.is_cancelled(),
+            cancel.is_cancelled(),
             "connection must be cancelled on pairing mismatch"
         );
-        // The denial frame must be on ctrl, not data.
-        let ctrl_frame = ctrl_rx
-            .try_recv()
-            .expect("ctrl must contain the denial notice");
         assert!(
-            send_rx.try_recv().is_err(),
-            "denial must NOT appear on the data channel"
-        );
-        match ctrl_frame {
-            WsMessage::Text(text) => {
-                let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-                // NOTICE is ["NOTICE", <message>] — position 1 is the text.
-                let content = v.get(1).and_then(|c| c.as_str()).unwrap_or("");
-                assert_eq!(
-                    content,
-                    buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
-                    "ctrl must carry exact authorization_denied text"
-                );
-            }
-            other => panic!("ctrl frame must be Text; got {other:?}"),
-        }
-        assert!(
-            send_rx.try_recv().is_err(),
-            "no frame on data channel after pairing denial"
-        );
-    }
-
-    #[tokio::test]
-    async fn claimless_assertion_denied_on_ctrl() {
-        use buzz_auth::VerifiedAssertion;
-        use chrono::{Duration, Utc};
-        use nostr::Keys;
-
-        let proven_keys = Keys::generate();
-        let assertion = VerifiedAssertion::for_test(None, vec![Utc::now() + Duration::hours(1)]);
-        let (conn, mut send_rx, mut ctrl_rx) =
-            build_conn_with_assertion(assertion, proven_keys.public_key());
-
-        if let Err(denial) =
-            check_nip_fi_key_pairing(conn.nip_fi_assertion.as_ref(), proven_keys.public_key())
-        {
-            let _ = conn.ctrl_tx.try_send(WsMessage::Text(
-                crate::protocol::RelayMessage::notice(denial.nostr_text()).into(),
-            ));
-            conn.cancel.cancel();
-        }
-
-        assert!(
-            conn.cancel.is_cancelled(),
-            "claimless assertion must be denied"
+            matches!(*conn.auth_state.read().await, AuthState::Failed),
+            "auth_state must be Failed after pairing mismatch"
         );
         let ctrl_frame = ctrl_rx
             .try_recv()
-            .expect("ctrl must contain the denial notice");
+            .expect("ctrl channel must contain the denial notice frame");
         assert!(
             send_rx.try_recv().is_err(),
-            "denial must not appear on data channel"
+            "denial must not appear on the data channel"
         );
         match ctrl_frame {
             WsMessage::Text(text) => {
@@ -643,10 +504,10 @@ mod tests {
                 assert_eq!(
                     content,
                     buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
-                    "ctrl must carry exact authorization_denied text (claimless)"
+                    "ctrl frame must be exact restricted: authorization denied NOTICE"
                 );
             }
-            other => panic!("ctrl frame must be Text; got {other:?}"),
+            other => panic!("ctrl frame must be Text(NOTICE); got {other:?}"),
         }
     }
 }

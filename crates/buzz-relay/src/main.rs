@@ -489,13 +489,16 @@ async fn main() -> anyhow::Result<()> {
             "NIP-FI: warming JWKS snapshots"
         );
 
-        // Startup warm: call `get_snapshot` for each issuer. Returns `None`
-        // on failure — log a warn and continue; the relay starts, denies
-        // with 503, and the background loop owns recovery via bounded backoff.
+        // Startup warm: call `get_snapshot` for each issuer and record the
+        // result so the background loop can initialize each issuer's warm state
+        // from the actual startup outcome rather than always starting cold.
+        let mut startup_warm: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         for cfg in &jwks_configs {
-            match jwks_source.get_snapshot(&cfg.issuer).await {
+            let warmed = match jwks_source.get_snapshot(&cfg.issuer).await {
                 Some(_) => {
                     info!(issuer = %cfg.issuer, "NIP-FI: JWKS snapshot warmed");
+                    true
                 }
                 None => {
                     warn!(
@@ -503,52 +506,77 @@ async fn main() -> anyhow::Result<()> {
                         "NIP-FI: JWKS warm failed — admissions will deny with 503 \
                          until a snapshot lands; background refresh will retry"
                     );
+                    false
                 }
-            }
+            };
+            startup_warm.insert(cfg.issuer.clone(), warmed);
         }
 
-        // Background refresh loop: per-issuer cold/backoff state; supervised so
+        // Background refresh loop: per-issuer independent cadence/backoff; supervised so
         // an unexpected panic restarts rather than silently disabling refresh.
         // A panic kills only the inner task; the supervisor restarts it with
         // backoff, keeping the relay alive (denying with 503) while recovering.
         // The outer cancellation token terminates the supervisor cleanly.
         //
-        // Ceiling formula: 300 seconds, regardless of base_interval.
-        // `(v * 2).min(300)` correctly caps the cold-start backoff at 300s.
-        // (The prior `.min(base_interval_secs.max(300))` allowed the ceiling
-        // above 300 when base_interval exceeded it.)
+        // Each issuer tracks its own `next_attempt_at` (a tokio Instant) so a
+        // warm issuer on a short interval never causes a cold issuer to ignore
+        // its own backoff — only issuers whose deadline is due are refreshed on
+        // any given tick. Warm state is initialized from the startup results so
+        // a successfully-warmed issuer starts on its normal cadence, not cold backoff.
+        //
+        // Cold-start backoff ceiling: 300 seconds (`(v * 2).min(300)`).
         let refresh_source = Arc::clone(&jwks_source);
         let refresh_cancel = jwks_refresh_cancel.clone();
-        let base_interval_secs = jwks_configs
-            .iter()
-            .map(|c| c.contract.refresh_interval_seconds())
-            .min()
-            .unwrap_or(300);
         jwks_refresh_handle = Some(tokio::spawn(async move {
             // Supervisor: restart the inner worker if it exits unexpectedly.
             // Clean cancellation (token fired) terminates both the inner task
             // and this supervisor.
             let mut supervisor_backoff_secs: u64 = 1;
             loop {
-                // Per-issuer cold state: each issuer tracks its own backoff
-                // independently so a healthy issuer never parks a cold one.
-                let mut per_issuer_backoff: Vec<(String, u64, bool)> = jwks_configs
-                    .iter()
-                    .map(|c| (c.issuer.clone(), 5u64, false))
-                    .collect();
+                // Build per-issuer state: each entry holds the issuer URL, its
+                // configured refresh interval, its current cold backoff (only
+                // relevant when cold), whether it is warm, and the Instant of
+                // its next scheduled attempt. Warm state is seeded from startup.
+                //
+                // Tuple layout: (issuer, interval_secs, backoff_secs, warmed, next_attempt_at)
+                let now = tokio::time::Instant::now();
+                let per_issuer_state: Vec<(String, u64, u64, bool, tokio::time::Instant)> =
+                    jwks_configs
+                        .iter()
+                        .map(|c| {
+                            let interval = c.contract.refresh_interval_seconds();
+                            let warmed = *startup_warm.get(&c.issuer).unwrap_or(&false);
+                            // Warm issuers schedule their first refresh at +interval;
+                            // cold issuers start with a short initial backoff of 5s.
+                            let initial_delay = if warmed { interval } else { 5u64 };
+                            (
+                                c.issuer.clone(),
+                                interval,
+                                5u64, // initial cold backoff
+                                warmed,
+                                now + std::time::Duration::from_secs(initial_delay),
+                            )
+                        })
+                        .collect();
                 let inner_source = Arc::clone(&refresh_source);
                 let inner_cancel = refresh_cancel.clone();
-                let inner_base = base_interval_secs;
                 let inner_task = tokio::spawn(async move {
+                    // Per-issuer mutable state — moved into the inner task.
+                    // (issuer, interval_secs, backoff_secs, warmed, next_attempt_at)
+                    let mut state = per_issuer_state;
                     loop {
-                        // Compute sleep as the min across all per-issuer next-fire
-                        // times. An issuer that is warmed uses normal cadence;
-                        // a cold issuer uses its own backoff.
-                        let sleep_secs = per_issuer_backoff
-                            .iter()
-                            .map(|(_, backoff, warmed)| if *warmed { inner_base } else { *backoff })
-                            .min()
-                            .unwrap_or(inner_base);
+                        // Sleep until the earliest per-issuer next_attempt_at so
+                        // no issuer is woken earlier than needed and a cold issuer's
+                        // own backoff governs its retry cadence.
+                        let earliest =
+                            state
+                                .iter()
+                                .map(|(_, _, _, _, t)| *t)
+                                .min()
+                                .unwrap_or_else(|| {
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(300)
+                                });
 
                         tokio::select! {
                             biased;
@@ -556,14 +584,27 @@ async fn main() -> anyhow::Result<()> {
                                 tracing::debug!("NIP-FI: JWKS refresh loop cancelled");
                                 return;
                             }
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
+                            _ = tokio::time::sleep_until(earliest) => {}
                         }
 
-                        for (issuer, backoff, warmed) in &mut per_issuer_backoff {
+                        let now = tokio::time::Instant::now();
+                        for (issuer, interval_secs, backoff_secs, warmed, next_attempt_at) in
+                            &mut state
+                        {
+                            // Skip issuers whose own deadline has not arrived.
+                            if now < *next_attempt_at {
+                                continue;
+                            }
                             match inner_source.get_snapshot(issuer).await {
                                 Some(_) => {
-                                    tracing::debug!(issuer = %issuer, "NIP-FI: JWKS snapshot refreshed");
+                                    tracing::debug!(
+                                        issuer = %issuer,
+                                        "NIP-FI: JWKS snapshot refreshed"
+                                    );
                                     *warmed = true;
+                                    // Warmed: next attempt at normal cadence.
+                                    *next_attempt_at =
+                                        now + std::time::Duration::from_secs(*interval_secs);
                                 }
                                 None => {
                                     tracing::warn!(
@@ -572,8 +613,17 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                     if !*warmed {
                                         // Cold-start backoff: double, capped at 300s.
-                                        *backoff = (*backoff * 2).min(300);
+                                        *backoff_secs = (*backoff_secs * 2).min(300);
                                     }
+                                    // Next attempt governed by this issuer's own backoff
+                                    // (cold) or normal interval (warm but transient fail).
+                                    let retry_secs = if *warmed {
+                                        *interval_secs
+                                    } else {
+                                        *backoff_secs
+                                    };
+                                    *next_attempt_at =
+                                        now + std::time::Duration::from_secs(retry_secs);
                                 }
                             }
                         }

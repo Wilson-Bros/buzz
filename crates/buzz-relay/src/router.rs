@@ -383,9 +383,21 @@ async fn nip11_or_ws_handler(
             if state.shutting_down.load(Ordering::Relaxed) {
                 return (StatusCode::SERVICE_UNAVAILABLE, "relay restarting").into_response();
             }
+            // Capture the upgrade instant here — before the on_upgrade callback
+            // fires — so the NIP-FI session partition is rooted at the HTTP
+            // handshake, not the post-community-active-check instant.
+            // [FI-TRACE-LEASE-BOUND]
+            let connection_time = chrono::Utc::now();
             limit_relay_websocket(ws, max_frame_bytes)
                 .on_upgrade(move |socket| {
-                    handle_connection(socket, state, addr, tenant, nip_fi_assertion)
+                    handle_connection(
+                        socket,
+                        state,
+                        addr,
+                        tenant,
+                        nip_fi_assertion,
+                        connection_time,
+                    )
                 })
                 .into_response()
         }

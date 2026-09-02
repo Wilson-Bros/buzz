@@ -296,68 +296,81 @@ mod tests {
     #[test]
     fn private_state_denials_are_byte_identical() {
         // The spec's FI-TRACE-DENIAL-ORACLE: all private-state denial causes
-        // (key mismatch, claimless assertion, expired lease) must map to
-        // `AuthorizationDenied` with byte-identical HTTP responses.
+        // (key mismatch, claimless assertion, expired lease) MUST map to the
+        // same denial class (`AuthorizationDenied`) and produce byte-identical
+        // wire frames on both ingresses.
         //
-        // This test drives two DISTINCT private-state conditions through the
-        // production pairing function and `denial_response`, asserting that both
-        // produce byte-identical 403 `authorization denied\n` bodies.
+        // With `enforce_nip_fi_key_pairing` owning the full denial path, both
+        // conditions reach the exact same `authorization_denied_frame(route)`
+        // call.  This test pins that call against the production frame builder
+        // and asserts that:
+        //   1. Root and audio denial frames carry the correct denial text.
+        //   2. `AuthorizationDenied` HTTP response is 403 exact bytes.
+        //   3. `EvidenceRejected` (public) is distinct from `AuthorizationDenied`
+        //      (private-state) — the oracle property.
         //
         // Mutation evidence:
-        //   A) Map key-mismatch to a different DenialClass → `resp_key_mismatch`
-        //      status or body differs → assert_eq panics.
-        //   B) Map claimless to Ok(_) → `check_nip_fi_key_pairing(claimless, any)`
-        //      returns Ok → the `Err` arm is unreachable and this test would panic
-        //      at the unwrap.
-        use buzz_auth::VerifiedAssertion;
-        use chrono::{Duration, Utc};
-        use nostr::Keys;
+        //   A) Change `DenialClass::AuthorizationDenied` in `authorization_denied_frame`
+        //      → `nostr_text()` differs → root/audio text assertions panic.
+        //   B) Swap the root NOTICE with a raw string → JSON parse fails or
+        //      content assertion panics.
+        //   C) Map `EvidenceRejected` to the same body → distinctness assert panics.
+        use crate::nip_fi_session::{authorization_denied_frame, NipFiWsRoute};
+        use axum::extract::ws::Message as WsMessage;
 
-        // Condition A: key mismatch (asserted ≠ proven).
-        let asserted_keys = Keys::generate();
-        let proven_keys = Keys::generate();
-        let assertion_mismatch = VerifiedAssertion::for_test(
-            Some(asserted_keys.public_key()),
-            vec![Utc::now() + Duration::hours(1)],
-        );
-        let denial_a = crate::handlers::auth::check_nip_fi_key_pairing(
-            Some(&assertion_mismatch),
-            proven_keys.public_key(),
-        )
-        .unwrap_err(); // key mismatch must return Err
+        let expected_text = buzz_auth::DenialClass::AuthorizationDenied.nostr_text();
 
-        // Condition B: claimless assertion (asserted_key = None).
-        let assertion_claimless =
-            VerifiedAssertion::for_test(None, vec![Utc::now() + Duration::hours(1)]);
-        let denial_b = crate::handlers::auth::check_nip_fi_key_pairing(
-            Some(&assertion_claimless),
-            proven_keys.public_key(),
-        )
-        .unwrap_err(); // claimless must return Err
+        // Root frame: NOTICE JSON, content == nostr_text().
+        let root_frame = authorization_denied_frame(NipFiWsRoute::Root);
+        match root_frame {
+            WsMessage::Text(t) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&t).expect("root denial frame is valid JSON");
+                let content = v.get(1).and_then(|c| c.as_str()).unwrap_or("");
+                assert_eq!(
+                    content, expected_text,
+                    "root denial frame content must equal AuthorizationDenied.nostr_text()"
+                );
+            }
+            other => panic!("root denial frame must be WsMessage::Text; got {other:?}"),
+        }
 
-        // Both distinct conditions must map to the same denial class.
+        // Audio frame: JSON object with type/message fields.
+        let audio_frame = authorization_denied_frame(NipFiWsRoute::Audio);
+        match audio_frame {
+            WsMessage::Text(t) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&t).expect("audio denial frame is valid JSON");
+                assert_eq!(
+                    v.get("type").and_then(|x| x.as_str()),
+                    Some("restricted"),
+                    "audio denial frame type must be 'restricted'"
+                );
+                assert_eq!(
+                    v.get("message").and_then(|x| x.as_str()),
+                    Some(expected_text),
+                    "audio denial frame message must equal AuthorizationDenied.nostr_text()"
+                );
+            }
+            other => panic!("audio denial frame must be WsMessage::Text; got {other:?}"),
+        }
+
+        // HTTP-level oracle: AuthorizationDenied → 403 exact bytes.
+        let resp_private = denial_response(DenialClass::AuthorizationDenied);
+        assert_eq!(resp_private.status(), StatusCode::FORBIDDEN);
         assert_eq!(
-            denial_a, denial_b,
-            "key-mismatch and claimless must produce the same denial class"
-        );
-
-        // Their HTTP responses must be byte-identical.
-        let resp_a = denial_response(denial_a);
-        let resp_b = denial_response(denial_b);
-        assert_eq!(resp_a.status(), resp_b.status());
-        assert_eq!(
-            body_bytes(resp_a),
-            body_bytes(resp_b),
-            "private-state rows must produce byte-identical HTTP bodies [FI-TRACE-DENIAL-ORACLE]"
+            body_bytes(resp_private),
+            b"authorization denied\n",
+            "private-state denial HTTP body must be 'authorization denied\\n' [FI-TRACE-DENIAL-ORACLE]"
         );
 
         // Distinctness: public-evidence denial (EvidenceRejected) produces
         // different bytes from private-state denial (AuthorizationDenied).
         let resp_evidence = denial_response(DenialClass::EvidenceRejected);
-        let resp_private = denial_response(DenialClass::AuthorizationDenied);
+        let resp_private2 = denial_response(DenialClass::AuthorizationDenied);
         assert_ne!(
             body_bytes(resp_evidence),
-            body_bytes(resp_private),
+            body_bytes(resp_private2),
             "public-evidence denial must be distinct from private-state denial"
         );
     }
