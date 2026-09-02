@@ -92,15 +92,19 @@ function Container({
   buttonSize = 48,
   children,
   className,
+  edgeDraggable = false,
   menuRadius = 20,
   menuWidth = 320,
+  motionDisabled = false,
   onMorphAnimationComplete,
 }: {
   buttonSize?: number;
   children: React.ReactNode;
   className?: string;
+  edgeDraggable?: boolean;
   menuRadius?: number;
   menuWidth?: number;
+  motionDisabled?: boolean;
   onMorphAnimationComplete?: (open: boolean) => void;
 }) {
   const { anchor, direction, open, setOpen } = useBloomContext();
@@ -163,12 +167,39 @@ function Container({
           zIndex: open ? 50 : "auto",
         }}
         transition={
-          reduceMotion
+          reduceMotion || motionDisabled || !open
             ? { duration: 0 }
             : { bounce: 0.15, type: "spring", visualDuration: 0.25 }
         }
       >
         <div ref={measureRef}>{children}</div>
+        {open && edgeDraggable ? (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 z-10"
+          >
+            <div
+              className="pointer-events-auto absolute inset-x-0 top-0 h-2 touch-none cursor-grab active:cursor-grabbing"
+              data-bestie-drag-edge="top"
+              data-bestie-drag-handle
+            />
+            <div
+              className="pointer-events-auto absolute inset-x-0 bottom-0 h-2 touch-none cursor-grab active:cursor-grabbing"
+              data-bestie-drag-edge="bottom"
+              data-bestie-drag-handle
+            />
+            <div
+              className="pointer-events-auto absolute inset-y-2 left-0 w-2 touch-none cursor-grab active:cursor-grabbing"
+              data-bestie-drag-edge="left"
+              data-bestie-drag-handle
+            />
+            <div
+              className="pointer-events-auto absolute inset-y-2 right-0 w-2 touch-none cursor-grab active:cursor-grabbing"
+              data-bestie-drag-edge="right"
+              data-bestie-drag-handle
+            />
+          </div>
+        ) : null}
       </motion.div>
     </div>
   );

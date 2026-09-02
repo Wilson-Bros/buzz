@@ -1,5 +1,6 @@
 import * as React from "react";
 import { LayoutGroup, motion } from "motion/react";
+import { createPortal } from "react-dom";
 
 import { Bloom } from "./BloomMenu";
 import { BestiePopover, BestieTriggerVisual } from "./BestiePopover";
@@ -42,6 +43,7 @@ export function BestieGlobalOverlay() {
   const [open, setOpen] = React.useState(false);
   const [placement, setPlacement] = React.useState<Placement | null>(null);
   const [shareAvatarLayout, setShareAvatarLayout] = React.useState(true);
+  const [dragging, setDragging] = React.useState(false);
   const [position, setPosition] = React.useState<Point>(initialPoint);
   const dragRef = React.useRef<
     | {
@@ -71,19 +73,20 @@ export function BestieGlobalOverlay() {
   const activePlacement = open && placement ? placement : currentPlacement;
 
   const updateOpen = (nextOpen: boolean) => {
-    setShareAvatarLayout(true);
+    setShareAvatarLayout(nextOpen);
     if (nextOpen) setPlacement(currentPlacement);
     setOpen(nextOpen);
   };
 
-  return (
+  return createPortal(
     <div
-      className="pointer-events-auto fixed z-[70]"
+      className="pointer-events-auto fixed z-[200]"
       data-testid="bestie-floating-avatar"
       onPointerCancel={(event) => {
         const drag = dragRef.current;
         if (!drag || drag.pointerId !== event.pointerId) return;
         dragRef.current = undefined;
+        setDragging(false);
         if (event.currentTarget.hasPointerCapture(event.pointerId)) {
           event.currentTarget.releasePointerCapture(event.pointerId);
         }
@@ -106,7 +109,8 @@ export function BestieGlobalOverlay() {
         if (!surface) return;
         event.preventDefault();
         event.currentTarget.setPointerCapture(event.pointerId);
-        if (open) setShareAvatarLayout(false);
+        setDragging(true);
+        setShareAvatarLayout(false);
         dragRef.current = {
           bounds: {
             maxX: window.innerWidth - EDGE_INSET - surface.right,
@@ -138,6 +142,7 @@ export function BestieGlobalOverlay() {
         if (!drag || drag.pointerId !== event.pointerId) return;
         if (!drag.open) suppressClickRef.current = drag.moved;
         dragRef.current = undefined;
+        setDragging(false);
         if (event.currentTarget.hasPointerCapture(event.pointerId)) {
           event.currentTarget.releasePointerCapture(event.pointerId);
         }
@@ -166,10 +171,12 @@ export function BestieGlobalOverlay() {
           <Bloom.Container
             buttonSize={AVATAR_SIZE}
             className="border border-border/70 bg-popover text-popover-foreground ring-1 ring-foreground/5"
+            edgeDraggable
             menuRadius={20}
             menuWidth={320}
+            motionDisabled={dragging}
             onMorphAnimationComplete={(isOpen) => {
-              if (isOpen) setShareAvatarLayout(false);
+              setShareAvatarLayout(!isOpen);
             }}
           >
             <Bloom.Trigger
@@ -177,6 +184,7 @@ export function BestieGlobalOverlay() {
               className="flex h-12 w-12 touch-none select-none items-center justify-center rounded-full focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring [&_img]:pointer-events-none"
             >
               <motion.div
+                key={shareAvatarLayout ? "shared-avatar" : "static-avatar"}
                 layoutId={
                   shareAvatarLayout ? BESTIE_AVATAR_LAYOUT_ID : undefined
                 }
@@ -198,6 +206,7 @@ export function BestieGlobalOverlay() {
           </Bloom.Container>
         </Bloom.Root>
       </LayoutGroup>
-    </div>
+    </div>,
+    document.body,
   );
 }

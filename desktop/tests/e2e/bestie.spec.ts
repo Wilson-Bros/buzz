@@ -45,6 +45,11 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
 
   const floatingAvatar = page.getByTestId("bestie-floating-avatar");
   await expect(floatingAvatar).toBeVisible();
+  expect(
+    await floatingAvatar.evaluate(
+      (element) => element.parentElement === document.body,
+    ),
+  ).toBe(true);
   await expect(floatingAvatar.getByTestId("bestie-empty-mark")).toBeVisible();
   await floatingAvatar.click();
   await expect(
@@ -109,7 +114,12 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   const bloomAvatar = bloomContent.getByTestId("bestie-agent-avatar");
   const openPanelBeforeDrag = await bloomContent.boundingBox();
   const openAvatarBeforeDrag = await bloomAvatar.boundingBox();
-  const dragHandle = bloomContent.locator("[data-bestie-drag-handle]");
+  for (const edge of ["top", "right", "bottom", "left"]) {
+    await expect(
+      floatingAvatar.locator(`[data-bestie-drag-edge="${edge}"]`),
+    ).toBeVisible();
+  }
+  const dragHandle = floatingAvatar.locator('[data-bestie-drag-edge="bottom"]');
   const dragHandleBox = await dragHandle.boundingBox();
   expect(dragHandleBox).not.toBeNull();
   await page.mouse.move(
@@ -149,6 +159,8 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   await expect(page.getByTestId("bestie-activity-dot").last()).toBeVisible();
   await page.getByRole("button", { name: "Close Bestie" }).click();
   const beforeDrag = await floatingAvatar.boundingBox();
+  const collapsedAvatar = floatingAvatar.getByTestId("bestie-trigger-avatar");
+  const collapsedAvatarBeforeDrag = await collapsedAvatar.boundingBox();
   expect(beforeDrag).not.toBeNull();
   await page.mouse.move(
     (beforeDrag?.x ?? 0) + (beforeDrag?.width ?? 0) / 2,
@@ -162,8 +174,25 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   );
   await page.mouse.up();
   const afterDrag = await floatingAvatar.boundingBox();
+  const collapsedAvatarAfterDrag = await collapsedAvatar.boundingBox();
   expect(afterDrag?.x).toBeLessThan(beforeDrag?.x ?? 0);
   expect(afterDrag?.y).toBeGreaterThan(beforeDrag?.y ?? 0);
+  expect(
+    Math.abs(
+      (afterDrag?.x ?? 0) -
+        (beforeDrag?.x ?? 0) -
+        ((collapsedAvatarAfterDrag?.x ?? 0) -
+          (collapsedAvatarBeforeDrag?.x ?? 0)),
+    ),
+  ).toBeLessThan(1);
+  expect(
+    Math.abs(
+      (afterDrag?.y ?? 0) -
+        (beforeDrag?.y ?? 0) -
+        ((collapsedAvatarAfterDrag?.y ?? 0) -
+          (collapsedAvatarBeforeDrag?.y ?? 0)),
+    ),
+  ).toBeLessThan(1);
 
   await page.getByTestId("channel-general").click();
   const messageRow = page.getByTestId("message-row").first();
