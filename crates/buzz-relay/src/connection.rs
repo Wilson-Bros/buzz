@@ -215,6 +215,10 @@ pub async fn handle_connection(
     .await;
 }
 
+// `handle_active_connection` inherits the connection handler's natural parameter
+// surface (socket, state, addr, tenant, conn_id, control, assertion, connection_time).
+// Collapsing into a struct would just move the fields without reducing coupling.
+#[allow(clippy::too_many_arguments)]
 async fn handle_active_connection(
     socket: WebSocket,
     state: Arc<AppState>,

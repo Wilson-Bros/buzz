@@ -1885,7 +1885,10 @@ mod tests {
 
         // Set up a local WS server that runs `handle_active_audio_connection`.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<CancellationToken>();
+        // conn_cancel is created here so the test retains it for the
+        // is_cancelled() assertion. The token is cloned into the server closure.
+        let conn_cancel = CancellationToken::new();
+        let cancel_for_assert = conn_cancel.clone();
         let state_c = Arc::clone(&state);
         let tenant_c = tenant.clone();
         let assertion_c = assertion.clone();
@@ -1896,26 +1899,22 @@ mod tests {
         let addr = listener.local_addr().expect("test listener addr");
 
         let server = tokio::spawn(async move {
-            let conn_cancel = CancellationToken::new();
-            let _control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
-            let _ = cancel_tx.send(conn_cancel);
-
             let app = Router::new().route(
                 "/",
                 get({
                     let state_i = Arc::clone(&state_c);
                     let tenant_i = tenant_c.clone();
                     let assertion_i = assertion_c.clone();
+                    // Clone once for the closure; the original is retained
+                    // outside for the cancellation assertion.
+                    let cancel_i = conn_cancel.clone();
                     move |ws: WebSocketUpgrade| {
                         let state_i = Arc::clone(&state_i);
                         let tenant_i = tenant_i.clone();
                         let assertion_i = assertion_i.clone();
                         let conn_time = chrono::Utc::now();
-                        // Manufacture a control with a fresh cancel — the one
-                        // sent to cancel_tx is what the test inspects.
-                        let cancel_inner = CancellationToken::new();
                         let control_inner =
-                            crate::state::CommunityConnectionControl::new(cancel_inner);
+                            crate::state::CommunityConnectionControl::new(cancel_i.clone());
                         async move {
                             ws.on_upgrade(move |socket| async move {
                                 handle_active_audio_connection(
@@ -2030,10 +2029,16 @@ mod tests {
             "connection must close after audio pairing mismatch; got {close:?}"
         );
 
+        // The retained token must be cancelled — this is the named mutation
+        // target: omit cancel.cancel() inside enforce_nip_fi_key_pairing and
+        // this assertion fails even though the socket still drops.
+        assert!(
+            cancel_for_assert.is_cancelled(),
+            "conn_cancel must be cancelled after audio pairing mismatch"
+        );
+
         server.abort();
         let _ = server.await;
-        // cancel_rx went unused (we checked via WS close) — drop it.
-        drop(cancel_rx);
     }
 
     // ── Witness C: Audio expiry through shared constructor + real audio writer ──

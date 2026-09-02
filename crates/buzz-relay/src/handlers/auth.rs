@@ -493,18 +493,25 @@ mod tests {
         let ctrl_frame = ctrl_rx
             .try_recv()
             .expect("ctrl channel must contain the denial notice frame");
+        // Queue must hold exactly one frame — no duplicate denial.
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "ctrl channel must hold exactly one frame after pairing mismatch"
+        );
         assert!(
             send_rx.try_recv().is_err(),
             "denial must not appear on the data channel"
         );
+        // Assert the full wire text byte-for-byte.
+        let expected_notice = crate::protocol::RelayMessage::notice(
+            buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
+        );
         match ctrl_frame {
             WsMessage::Text(text) => {
-                let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
-                let content = v.get(1).and_then(|c| c.as_str()).unwrap_or("");
                 assert_eq!(
-                    content,
-                    buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
-                    "ctrl frame must be exact restricted: authorization denied NOTICE"
+                    text,
+                    expected_notice,
+                    "ctrl frame must be byte-identical to RelayMessage::notice(\"restricted: authorization denied\")"
                 );
             }
             other => panic!("ctrl frame must be Text(NOTICE); got {other:?}"),
