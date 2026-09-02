@@ -16,6 +16,7 @@ import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
 import { Badge } from "@/shared/ui/badge";
+import { ProtectedBestieCardBadge } from "@protected-feature-components";
 import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
@@ -316,6 +317,9 @@ function AgentPersonaCard({
       }
       avatarUrl={avatarUrl}
       dataTestId={`persona-agent-row-${persona.id}`}
+      footerAccessory={
+        agent ? <ProtectedBestieCardBadge agent={agent} /> : null
+      }
       label={title}
       subtitle={subtitle}
       onClick={() => {
@@ -398,6 +402,7 @@ function StandaloneAgentCard({
       }
       avatarUrl={profileQuery.data?.avatarUrl}
       dataTestId={`managed-agent-${agent.pubkey}`}
+      footerAccessory={<ProtectedBestieCardBadge agent={agent} />}
       label={title}
       subtitle={
         // Definition-less instance: no authored description exists, so fall

@@ -2475,6 +2475,7 @@ function resetMockRelayAgents(config?: E2eConfig) {
 
 function resetMockManagedAgents(config?: E2eConfig) {
   mockManagedAgents = [];
+  mockBestieAssignment = null;
   mockManagedAgentRuntimes = (config?.mock?.managedAgentRuntimes ?? []).map(
     (seed) => ({
       pubkey: seed.pubkey,
@@ -3225,6 +3226,10 @@ let mockClosedChannelLiveSubscription = false;
 const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
 let mockManagedAgentRuntimes: MockManagedAgentRuntimeRow[] = [];
+let mockBestieAssignment: {
+  agent_pubkey: string;
+  canonical_channel_id: string | null;
+} | null = null;
 
 // Mutable `save_subscriptions` table mirror — TEST-ONLY.
 //
@@ -13734,6 +13739,37 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "list_managed_agent_runtimes":
         return mockManagedAgentRuntimes.map((row) => ({ ...row }));
+      case "get_bestie_assignment":
+        return mockBestieAssignment ? { ...mockBestieAssignment } : null;
+      case "assign_bestie": {
+        const agentPubkey = (payload as { agentPubkey: string }).agentPubkey;
+        const agent = getMockManagedAgent(agentPubkey);
+        if (agent.backend.type !== "local") {
+          throw new Error("only a local managed agent can be your Bestie");
+        }
+        mockBestieAssignment = {
+          agent_pubkey: agent.pubkey,
+          canonical_channel_id:
+            mockBestieAssignment?.agent_pubkey === agent.pubkey
+              ? mockBestieAssignment.canonical_channel_id
+              : null,
+        };
+        return { ...mockBestieAssignment };
+      }
+      case "clear_bestie_assignment":
+        mockBestieAssignment = null;
+        return undefined;
+      case "resolve_bestie_conversation": {
+        if (!mockBestieAssignment) {
+          throw new Error("choose an agent before opening Bestie");
+        }
+        const channel = await handleOpenDm(
+          { pubkeys: [mockBestieAssignment.agent_pubkey] },
+          activeConfig,
+        );
+        mockBestieAssignment.canonical_channel_id = channel.id;
+        return channel;
+      }
       case "start_managed_agent_runtime":
         return handleManagedAgentRuntimeAction(
           "start",
