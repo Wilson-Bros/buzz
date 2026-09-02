@@ -461,6 +461,8 @@ export function BestiePopover({
         <Textarea
           aria-label={`Message ${agent.name}`}
           className="min-h-24 resize-none rounded-2xl pb-11"
+          data-bloom-autofocus
+          data-testid="bestie-composer"
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
             if (

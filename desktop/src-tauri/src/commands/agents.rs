@@ -6,7 +6,7 @@ use super::managed_agent_definition::validate_create_definition;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        bestie_assignment::clear_agent_assignments, build_managed_agent_summary,
+        bestie_assignment::with_agent_assignments_cleared, build_managed_agent_summary,
         current_instance_id, ensure_persona_is_active, find_managed_agent_mut, load_managed_agents,
         load_personas, load_teams, managed_agent_avatar_url, managed_agents_base_dir,
         normalize_agent_args, resolve_provider_binary, save_managed_agents,
@@ -1139,13 +1139,14 @@ pub async fn delete_managed_agent(
             if !records.iter().any(|record| record.pubkey == pubkey) {
                 return Err(format!("agent {pubkey} not found"));
             }
-            clear_agent_assignments(&managed_agents_base_dir(&app)?, &pubkey)?;
-            if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
-                stop_managed_agent_process(&app, record, &mut runtimes)?;
-            }
-            state.clear_agent_session_caches(&pubkey);
-            records.retain(|record| record.pubkey != pubkey);
-            save_managed_agents(&app, &records)?;
+            with_agent_assignments_cleared(&managed_agents_base_dir(&app)?, &pubkey, || {
+                if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
+                    stop_managed_agent_process(&app, record, &mut runtimes)?;
+                }
+                state.clear_agent_session_caches(&pubkey);
+                records.retain(|record| record.pubkey != pubkey);
+                save_managed_agents(&app, &records)
+            })?;
             crate::managed_agents::delete_agent_key(&pubkey);
             // Tombstone after confirmed removal (inside lock; every published
             // agent tombstones). The NIP-IA kind:9035 archive request — which

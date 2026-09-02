@@ -14,11 +14,12 @@ type Anchor = "start" | "center" | "end";
 
 type BloomContextValue = {
   anchor: Anchor;
+  contentId: string;
   contentRef: React.RefObject<HTMLDivElement | null>;
   direction: Direction;
   open: boolean;
   setOpen: (open: boolean) => void;
-  triggerRef: React.RefObject<HTMLDivElement | null>;
+  triggerRef: React.RefObject<HTMLButtonElement | null>;
 };
 
 const BloomContext = React.createContext<BloomContextValue | null>(null);
@@ -42,8 +43,31 @@ function Root({
   onOpenChange: (open: boolean) => void;
   open: boolean;
 }) {
-  const triggerRef = React.useRef<HTMLDivElement>(null);
+  const triggerRef = React.useRef<HTMLButtonElement>(null);
   const contentRef = React.useRef<HTMLDivElement>(null);
+  const contentId = React.useId();
+  const previousOpenRef = React.useRef(open);
+
+  React.useEffect(() => {
+    const wasOpen = previousOpenRef.current;
+    previousOpenRef.current = open;
+    if (wasOpen === open) return;
+
+    const frame = requestAnimationFrame(() => {
+      if (open) {
+        const preferredTarget = contentRef.current?.querySelector<HTMLElement>(
+          "[data-bloom-autofocus]",
+        );
+        const fallbackTarget = contentRef.current?.querySelector<HTMLElement>(
+          "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href]",
+        );
+        (preferredTarget ?? fallbackTarget ?? contentRef.current)?.focus();
+      } else {
+        triggerRef.current?.focus();
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [open]);
 
   React.useEffect(() => {
     if (!open) return;
@@ -74,13 +98,14 @@ function Root({
   const value = React.useMemo(
     () => ({
       anchor,
+      contentId,
       contentRef,
       direction,
       open,
       setOpen: onOpenChange,
       triggerRef,
     }),
-    [anchor, direction, onOpenChange, open],
+    [anchor, contentId, direction, onOpenChange, open],
   );
 
   return (
@@ -215,48 +240,49 @@ function Trigger({
   children: React.ReactNode;
   className?: string;
 }) {
-  const { anchor, direction, open, setOpen, triggerRef } = useBloomContext();
-  if (open) return null;
+  const { anchor, contentId, direction, open, setOpen, triggerRef } =
+    useBloomContext();
 
   return (
-    <motion.div
+    <motion.button
+      aria-controls={contentId}
       aria-expanded={open}
-      aria-haspopup="menu"
+      aria-haspopup="dialog"
       aria-label={ariaLabel}
       className={className}
+      disabled={open}
       key="bloom-trigger"
       onClick={(event) => {
         event.preventDefault();
         event.stopPropagation();
         setOpen(true);
       }}
-      onKeyDown={(event) => {
-        if (event.key !== "Enter" && event.key !== " ") return;
-        event.preventDefault();
-        setOpen(true);
-      }}
       ref={triggerRef}
-      role="button"
       style={{
         ...(anchor === "end" ? { right: 0 } : { left: 0 }),
         ...(direction === "top" ? { bottom: 0 } : { top: 0 }),
+        pointerEvents: open ? "none" : "auto",
         position: "absolute",
+        visibility: open ? "hidden" : "visible",
       }}
-      tabIndex={0}
+      tabIndex={open ? -1 : 0}
+      type="button"
     >
       {children}
-    </motion.div>
+    </motion.button>
   );
 }
 
 function Content({
+  ariaLabel,
   children,
   className,
 }: {
+  ariaLabel: string;
   children: React.ReactNode;
   className?: string;
 }) {
-  const { anchor, contentRef, direction, open } = useBloomContext();
+  const { anchor, contentId, contentRef, direction, open } = useBloomContext();
   const reduceMotion = useReducedMotion();
   const hiddenY = direction === "top" ? 8 : -8;
 
@@ -264,6 +290,8 @@ function Content({
     <AnimatePresence>
       {open ? (
         <motion.div
+          aria-label={ariaLabel}
+          aria-modal="false"
           animate={{
             filter: "blur(0px)",
             opacity: 1,
@@ -286,8 +314,9 @@ function Content({
               : `translate3d(0, ${hiddenY}px, 0) scale(0.95)`,
           }}
           key="bloom-content"
+          id={contentId}
           ref={contentRef}
-          role="menu"
+          role="dialog"
           style={{
             transformOrigin: `${
               anchor === "start"
@@ -307,6 +336,7 @@ function Content({
                   visualDuration: 0.2,
                 }
           }
+          tabIndex={-1}
         >
           {children}
         </motion.div>

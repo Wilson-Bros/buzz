@@ -189,6 +189,20 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
           (openContainerAfterDrag?.width ?? 0)),
     ),
   ).toBeLessThan(1);
+
+  const floatingTrigger = floatingAvatar.getByRole("button", {
+    name: "Open Bestie",
+  });
+  await expect(floatingTrigger).toHaveAttribute("aria-haspopup", "dialog");
+  await floatingTrigger.focus();
+  await page.keyboard.press("Enter");
+  const keyboardOpenedPopover = page.getByTestId("bestie-bloom-content");
+  await expect(keyboardOpenedPopover).toHaveAttribute("role", "dialog");
+  await expect(page.getByTestId("bestie-composer")).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(keyboardOpenedPopover).toHaveCount(0);
+  await expect(floatingTrigger).toBeFocused();
+
   await sidebarBestie.click();
   await expect(page).toHaveURL(/\/channels\//);
   await expect(

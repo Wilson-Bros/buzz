@@ -1,6 +1,10 @@
 //! Durable, owner-and-relay-scoped Bestie designation storage.
 
-use std::{fs, io::ErrorKind, path::Path};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -84,16 +88,17 @@ pub fn assignment_matches(conn: &Connection, agent_pubkey: &str) -> Result<bool,
     Ok(get_assignment(conn)?.is_some_and(|assignment| assignment.agent_pubkey == normalized))
 }
 
-/// Clear this agent's designation from every existing community scope.
-///
-/// Call this while holding `managed_agents_store_lock` and before removing the
-/// agent record. If one database cannot be updated, deletion stops while the
-/// agent still exists, so no scope can be left pointing at a deleted agent.
-pub fn clear_agent_assignments(base_dir: &Path, agent_pubkey: &str) -> Result<usize, String> {
+#[derive(Clone)]
+struct ScopedAssignment {
+    agent_pubkey: String,
+    path: PathBuf,
+}
+
+fn retention_db_paths(base_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let retention_dir = base_dir.join("retention");
     let entries = match fs::read_dir(&retention_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(format!(
                 "failed to read retention directory {}: {error}",
@@ -102,8 +107,7 @@ pub fn clear_agent_assignments(base_dir: &Path, agent_pubkey: &str) -> Result<us
         }
     };
 
-    let normalized = agent_pubkey.trim().to_ascii_lowercase();
-    let mut cleared = 0;
+    let mut paths = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
             format!(
@@ -115,21 +119,106 @@ pub fn clear_agent_assignments(base_dir: &Path, agent_pubkey: &str) -> Result<us
         if path.extension().and_then(|extension| extension.to_str()) != Some("db") {
             continue;
         }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn matching_assignments(
+    base_dir: &Path,
+    agent_pubkey: &str,
+) -> Result<Vec<ScopedAssignment>, String> {
+    let normalized = agent_pubkey.trim().to_ascii_lowercase();
+    let mut assignments = Vec::new();
+    // Read and validate every scope before mutating any of them. A broken later
+    // database therefore cannot leave an already-cleared prefix behind.
+    for path in retention_db_paths(base_dir)? {
         let conn = open_retention_db(&path)?;
         ensure_table(&conn)?;
-        cleared += conn
-            .execute(
-                "DELETE FROM bestie_assignments WHERE singleton = 1 AND agent_pubkey = ?1",
-                params![normalized],
-            )
-            .map_err(|error| {
-                format!(
-                    "failed to clear bestie assignment in {}: {error}",
-                    path.display()
-                )
-            })?;
+        if assignment_matches(&conn, &normalized)? {
+            assignments.push(ScopedAssignment {
+                agent_pubkey: normalized.clone(),
+                path,
+            });
+        }
     }
-    Ok(cleared)
+    Ok(assignments)
+}
+
+fn clear_scope(assignment: &ScopedAssignment) -> Result<(), String> {
+    let conn = open_retention_db(&assignment.path)?;
+    conn.execute(
+        "DELETE FROM bestie_assignments WHERE singleton = 1 AND agent_pubkey = ?1",
+        params![assignment.agent_pubkey],
+    )
+    .map_err(|error| {
+        format!(
+            "failed to clear bestie assignment in {}: {error}",
+            assignment.path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn restore_assignments(assignments: &[ScopedAssignment]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for assignment in assignments {
+        let result = open_retention_db(&assignment.path).and_then(|mut conn| {
+            replace_assignment(&mut conn, &assignment.agent_pubkey).map(|_| ())
+        });
+        if let Err(error) = result {
+            failures.push(format!("{}: {error}", assignment.path.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to restore bestie assignments: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn clear_scoped_assignments(
+    assignments: &[ScopedAssignment],
+    mut clear: impl FnMut(&ScopedAssignment) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut cleared = Vec::new();
+    for assignment in assignments {
+        if let Err(error) = clear(assignment) {
+            return match restore_assignments(&cleared) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(format!("{error}; {restore_error}")),
+            };
+        }
+        cleared.push(assignment.clone());
+    }
+    Ok(())
+}
+
+/// Run agent deletion work with this agent's community-scoped Bestie
+/// assignments temporarily cleared.
+///
+/// Call this while holding `managed_agents_store_lock`. Every matching scope is
+/// snapshotted before the first write. A partial clear, or any later stop/save
+/// failure returned by `delete`, restores the snapshot before the error is
+/// propagated. Assignments remain cleared only when `delete` succeeds.
+pub fn with_agent_assignments_cleared<T>(
+    base_dir: &Path,
+    agent_pubkey: &str,
+    delete: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let assignments = matching_assignments(base_dir, agent_pubkey)?;
+    clear_scoped_assignments(&assignments, clear_scope)?;
+    match delete() {
+        Ok(value) => Ok(value),
+        Err(error) => match restore_assignments(&assignments) {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!("{error}; {restore_error}")),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -203,11 +292,8 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("assign third scope: {error}"));
 
-        assert_eq!(
-            clear_agent_assignments(dir.path(), &agent)
-                .unwrap_or_else(|error| panic!("clear agent assignments: {error}")),
-            2
-        );
+        with_agent_assignments_cleared(dir.path(), &agent, || Ok(()))
+            .unwrap_or_else(|error| panic!("clear agent assignments: {error}"));
         assert_eq!(
             get_assignment(
                 &open_retention_db(&first_path)
@@ -225,5 +311,75 @@ mod tests {
             .map(|assignment| assignment.agent_pubkey),
             Some(other)
         );
+    }
+
+    #[test]
+    fn later_scope_clear_failure_restores_the_already_cleared_prefix() {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let retention_dir = dir.path().join("retention");
+        fs::create_dir_all(&retention_dir)
+            .unwrap_or_else(|error| panic!("create retention dir: {error}"));
+        let agent = "a".repeat(64);
+        for name in ["first.db", "second.db"] {
+            replace_assignment(
+                &mut open_retention_db(&retention_dir.join(name))
+                    .unwrap_or_else(|error| panic!("open {name}: {error}")),
+                &agent,
+            )
+            .unwrap_or_else(|error| panic!("assign {name}: {error}"));
+        }
+
+        let assignments = matching_assignments(dir.path(), &agent)
+            .unwrap_or_else(|error| panic!("snapshot assignments: {error}"));
+        let result = clear_scoped_assignments(&assignments, |assignment| {
+            if assignment.path.ends_with("second.db") {
+                Err("injected later retention DB failure".to_string())
+            } else {
+                clear_scope(assignment)
+            }
+        });
+
+        assert!(result.is_err());
+        for name in ["first.db", "second.db"] {
+            let conn = open_retention_db(&retention_dir.join(name))
+                .unwrap_or_else(|error| panic!("reopen {name}: {error}"));
+            assert!(assignment_matches(&conn, &agent)
+                .unwrap_or_else(|error| panic!("read {name}: {error}")));
+        }
+    }
+
+    fn assert_later_deletion_failure_restores_assignment(failure: &str) {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let retention_dir = dir.path().join("retention");
+        fs::create_dir_all(&retention_dir)
+            .unwrap_or_else(|error| panic!("create retention dir: {error}"));
+        let path = retention_dir.join("owner.db");
+        let agent = "a".repeat(64);
+        replace_assignment(
+            &mut open_retention_db(&path)
+                .unwrap_or_else(|error| panic!("open assignment db: {error}")),
+            &agent,
+        )
+        .unwrap_or_else(|error| panic!("assign agent: {error}"));
+
+        let result = with_agent_assignments_cleared(dir.path(), &agent, || {
+            Err::<(), _>(failure.to_string())
+        });
+
+        assert_eq!(result, Err(failure.to_string()));
+        let conn = open_retention_db(&path)
+            .unwrap_or_else(|error| panic!("reopen assignment db: {error}"));
+        assert!(assignment_matches(&conn, &agent)
+            .unwrap_or_else(|error| panic!("read restored assignment: {error}")));
+    }
+
+    #[test]
+    fn stop_failure_after_cleanup_restores_assignment() {
+        assert_later_deletion_failure_restores_assignment("injected stop failure");
+    }
+
+    #[test]
+    fn save_failure_after_cleanup_restores_assignment() {
+        assert_later_deletion_failure_restores_assignment("injected save failure");
     }
 }

@@ -181,7 +181,7 @@ export function BestieGlobalOverlay() {
           >
             <Bloom.Trigger
               ariaLabel="Open Bestie"
-              className="flex h-12 w-12 touch-none select-none items-center justify-center rounded-full focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring [&_img]:pointer-events-none"
+              className="flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border-0 bg-transparent p-0 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring [&_img]:pointer-events-none"
             >
               <motion.div
                 key={shareAvatarLayout ? "shared-avatar" : "static-avatar"}
@@ -195,7 +195,7 @@ export function BestieGlobalOverlay() {
                 />
               </motion.div>
             </Bloom.Trigger>
-            <Bloom.Content className="p-4">
+            <Bloom.Content ariaLabel="Bestie" className="p-4">
               <BestiePopover
                 avatarLayoutId={
                   shareAvatarLayout ? BESTIE_AVATAR_LAYOUT_ID : undefined
