@@ -1097,6 +1097,16 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Begin an event-write transaction through the pre-operation API name.
+    ///
+    /// New callers should use [`Self::begin_event_write_transaction`] so the
+    /// semantic intent is explicit. This alias preserves the crate's public
+    /// API while emitting the same operation-aware and compatibility metrics.
+    #[deprecated(note = "use Db::begin_event_write_transaction")]
+    pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        self.begin_event_write_transaction().await
+    }
+
     /// Insert an event while holding and validating an admitted serving-write
     /// lease under the community ordering lock through commit.
     ///

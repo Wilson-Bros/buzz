@@ -371,6 +371,22 @@ pub async fn list_channels(
     community_id: CommunityId,
     visibility: Option<&str>,
 ) -> Result<Vec<ChannelRecord>> {
+    list_channels_with_operation(
+        pool,
+        community_id,
+        visibility,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await
+}
+
+async fn list_channels_with_operation(
+    pool: &PgPool,
+    community_id: CommunityId,
+    visibility: Option<&str>,
+    operation: crate::observability::WriterOperation,
+) -> Result<Vec<ChannelRecord>> {
+    let mut connection = crate::observability::acquire_writer(pool, operation).await?;
     let rows = if let Some(vis) = visibility {
         sqlx::query(
             r#"
@@ -389,7 +405,7 @@ pub async fn list_channels(
         )
         .bind(community_id.as_uuid())
         .bind(vis)
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await?
     } else {
         sqlx::query(
@@ -408,7 +424,7 @@ pub async fn list_channels(
             "#,
         )
         .bind(community_id.as_uuid())
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await?
     };
 
@@ -910,6 +926,22 @@ impl Db {
         visibility: Option<&str>,
     ) -> Result<Vec<ChannelRecord>> {
         list_channels(&self.pool, community_id, visibility).await
+    }
+
+    /// Lists channels during startup reconciliation.
+    #[datastore_span(name = "list_channels_for_bootstrap", system = "postgresql")]
+    pub async fn list_channels_for_bootstrap(
+        &self,
+        community_id: CommunityId,
+        visibility: Option<&str>,
+    ) -> Result<Vec<ChannelRecord>> {
+        list_channels_with_operation(
+            &self.pool,
+            community_id,
+            visibility,
+            crate::observability::WriterOperation::Bootstrap,
+        )
+        .await
     }
 
     /// Updates a channel's name and/or description.

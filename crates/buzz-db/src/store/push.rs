@@ -938,6 +938,11 @@ where
     if rows.is_empty() {
         return Ok(None);
     }
+    // The claim query is a single autocommitted statement. Release its pool
+    // slot before loading source events, because the production loader owns a
+    // separately attributed acquisition. Holding this connection across the
+    // load would self-starve a supported size-one writer pool.
+    drop(connection);
     let community = CommunityId::from_uuid(rows[0].try_get("community_id")?);
     let mut attempts = std::collections::HashMap::with_capacity(rows.len());
     for row in &rows {
@@ -960,6 +965,9 @@ where
     // recoverable after their claim lease expires.
     let gone: Vec<Vec<u8>> = attempts.into_keys().collect();
     if !gone.is_empty() {
+        let mut connection =
+            acquire_operation_connection(pool, crate::observability::WriterOperation::Maintenance)
+                .await?;
         sqlx::query(
             "DELETE FROM push_match_queue \
              WHERE community_id=$1 AND claim_id=$2 AND state='matching' AND event_id = ANY($3)",
@@ -1527,7 +1535,9 @@ impl Db {
 mod postgres_tests {
     use super::*;
     use crate::migration;
+    use sqlx::postgres::PgPoolOptions;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Barrier;
 
     async fn setup_pool() -> PgPool {
@@ -2218,6 +2228,51 @@ mod postgres_tests {
                 .await
                 .expect("expired claim remains recoverable")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn matcher_claim_and_load_support_size_one_pool() {
+        let setup = setup_pool().await;
+        sqlx::query("DELETE FROM push_match_queue")
+            .execute(&setup)
+            .await
+            .expect("drain matcher queue");
+        let community = make_community(&setup).await;
+        activate(&setup, community, &[83; 32], "install", &[84; 32], 1).await;
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "size one")
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign event");
+        crate::event::insert_event(&setup, community, &event, None)
+            .await
+            .expect("insert event");
+        setup.close().await;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(250))
+            .connect(&crate::test_support::database_url())
+            .await
+            .expect("connect size-one matcher pool");
+        let batch = tokio::time::timeout(
+            Duration::from_secs(2),
+            claim_due_match_batch(&pool, 16, Utc::now() + chrono::Duration::minutes(1)),
+        )
+        .await
+        .expect("matcher must not self-starve on a size-one pool")
+        .expect("claim and source load must succeed")
+        .expect("seeded matcher job must be claimed");
+        assert_eq!(batch.community, community);
+        assert_eq!(batch.jobs.len(), 1);
+        assert_eq!(batch.jobs[0].event.event.id, event.id);
+
+        let ids = vec![event.id.as_bytes().to_vec()];
+        assert_eq!(
+            complete_match_batch(&pool, community, batch.claim_id, &ids)
+                .await
+                .expect("complete size-one matcher batch"),
+            1
         );
     }
 

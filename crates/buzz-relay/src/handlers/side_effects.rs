@@ -3319,7 +3319,10 @@ pub async fn reconcile_channel_events(
 ) -> anyhow::Result<()> {
     use buzz_db::event::EventQuery;
 
-    let channels = state.db.list_channels(tenant.community(), None).await?;
+    let channels = state
+        .db
+        .list_channels_for_bootstrap(tenant.community(), None)
+        .await?;
     if channels.is_empty() {
         return Ok(());
     }

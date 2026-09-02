@@ -306,7 +306,43 @@ static POOL_WAITERS: [Mutex<u64>; PoolOperation::ALL.len()] =
 #[cfg(test)]
 static POOL_METRICS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(test)]
+#[derive(Clone)]
+struct WaiterPublishTestHook {
+    pair: PoolOperation,
+    value: u64,
+    entered: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+static WAITER_PUBLISH_TEST_HOOK: Mutex<Option<WaiterPublishTestHook>> = Mutex::new(None);
+
+#[cfg(test)]
+static WAITER_LAST_PUBLISHED: [Mutex<u64>; PoolOperation::ALL.len()] =
+    [const { Mutex::new(u64::MAX) }; PoolOperation::ALL.len()];
+
 fn publish_waiters(pair: PoolOperation, value: u64) {
+    #[cfg(test)]
+    {
+        let hook = WAITER_PUBLISH_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            if hook.pair == pair
+                && hook.value == value
+                && hook.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                hook.entered.wait();
+                hook.release.wait();
+            }
+        }
+        *WAITER_LAST_PUBLISHED[pair.index()]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+    }
     metrics::gauge!(
         "buzz_db_pool_waiters",
         "pool_role" => pair.pool_role(),
@@ -1000,6 +1036,48 @@ mod tests {
         assert_eq!(balanced, Some(0.0));
     }
 
+    #[test]
+    fn waiter_publication_is_serialized_with_state_mutation() {
+        let _test_guard = super::POOL_METRICS_TEST_LOCK.blocking_lock();
+        let pair = PoolOperation::WriterTenantResolution;
+        let first = PoolAcquireAttempt::start(pair, false);
+        let second = PoolAcquireAttempt::start(pair, false);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *super::WAITER_PUBLISH_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(super::WaiterPublishTestHook {
+                pair,
+                value: 1,
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            });
+
+        let first_drop = std::thread::spawn(move || drop(first));
+        entered.wait();
+        let mutation_lock_held = super::POOL_WAITERS[pair.index()].try_lock().is_err();
+        release.wait();
+        first_drop.join().expect("first drop completes");
+        drop(second);
+        *super::WAITER_PUBLISH_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        assert!(
+            mutation_lock_held,
+            "waiter state mutation must remain locked until its publication completes"
+        );
+        assert_eq!(
+            *super::WAITER_LAST_PUBLISHED[pair.index()]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "the final directly published waiter value must be balanced without a refresh"
+        );
+    }
+
     fn waiter_value(
         snapshot: &[(
             metrics_util::CompositeKey,
@@ -1054,7 +1132,10 @@ mod tests {
         let held = acquire_writer_with_legacy_metrics(&pool, WriterOperation::EventWrite)
             .await
             .expect("writer acquire succeeds");
-        let mut cancelled = Box::pin(acquire_writer(&pool, WriterOperation::Authentication));
+        let mut cancelled = Box::pin(acquire_writer_with_legacy_metrics(
+            &pool,
+            WriterOperation::Authentication,
+        ));
         tokio::select! {
             result = &mut cancelled => panic!("blocked acquisition unexpectedly completed: {result:?}"),
             () = tokio::time::sleep(Duration::from_millis(40)) => {}
@@ -1128,6 +1209,11 @@ mod tests {
         }
         assert_eq!(balanced_waiter, Some(0.0));
         assert_eq!(cancelled_terminal, Some(1));
+        assert_eq!(
+            legacy_acquisition_count(&snapshotter.snapshot().into_vec()),
+            1,
+            "cancelling a legacy seam must not expand its historical population"
+        );
         let held_reader = reader_pool
             .acquire()
             .await
@@ -1172,6 +1258,10 @@ mod tests {
             }
         }
         assert!(writer_success);
+        assert!(
+            !outcomes.contains_key(&("writer".to_owned(), "cancelled".to_owned())),
+            "legacy compatibility families must not add a cancellation population"
+        );
         assert!(outcomes.contains_key(&("writer".to_owned(), "error".to_owned())));
         let timeout_samples = outcomes
             .get(&("reader".to_owned(), "timeout".to_owned()))
@@ -1180,6 +1270,62 @@ mod tests {
             timeout_samples.iter().any(|sample| *sample >= 0.05),
             "timeout wait must include the saturated checkout delay: {timeout_samples:?}"
         );
+    }
+
+    async fn deletion_catalog_readiness_records_timeout_and_recovers() {
+        let _test_guard = super::POOL_METRICS_TEST_LOCK.lock().await;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&crate::test_support::database_url())
+            .await
+            .expect("connect size-one deletion readiness pool");
+        let db = crate::Db::from_pool(pool.clone());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let held = pool.acquire().await.expect("hold the only pool connection");
+        let timeout = db
+            .validate_deletion_serving_catalog_for_readiness(
+                tokio::time::Instant::now() + Duration::from_millis(40),
+            )
+            .await
+            .expect_err("saturated deletion catalog checkout must time out");
+        assert!(matches!(timeout, crate::DbError::DeadlineExceeded));
+        drop(held);
+        db.validate_deletion_serving_catalog_for_readiness(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("deletion catalog readiness must recover after pool release");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            waiter_value(&snapshot, "writer", "readiness"),
+            Some(0.0),
+            "deadline terminal must directly balance the readiness waiter"
+        );
+        for outcome in ["timeout", "success"] {
+            assert!(
+                snapshot.iter().any(|(key, _, _, value)| {
+                    if key.key().name() != "buzz_db_pool_acquire_attempts_total" {
+                        return false;
+                    }
+                    let labels = key.key().labels().collect::<Vec<_>>();
+                    let has = |name: &str, expected: &str| {
+                        labels
+                            .iter()
+                            .any(|label| label.key() == name && label.value() == expected)
+                    };
+                    has("pool_role", "writer")
+                        && has("operation", "readiness")
+                        && has("outcome", outcome)
+                        && matches!(value, DebugValue::Counter(1))
+                }),
+                "missing writer/readiness/{outcome} acquisition terminal"
+            );
+        }
     }
 
     async fn production_db_methods_emit_exact_pool_operation_labels() {
@@ -1662,6 +1808,12 @@ mod tests {
         #[ignore = "requires Postgres"]
         async fn production_db_methods_emit_exact_pool_operation_labels() {
             super::production_db_methods_emit_exact_pool_operation_labels().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[ignore = "requires Postgres"]
+        async fn deletion_catalog_readiness_records_timeout_and_recovers() {
+            super::deletion_catalog_readiness_records_timeout_and_recovers().await;
         }
 
         #[tokio::test(flavor = "current_thread")]

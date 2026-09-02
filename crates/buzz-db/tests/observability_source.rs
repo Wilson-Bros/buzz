@@ -96,6 +96,14 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(!observability.contains("\"other\""));
     assert!(!observability.contains("buzz_db_pool_acquire_timeouts_total"));
     assert!(!observability.contains("\"result\" =>"));
+    let legacy_transaction = observability
+        .split_once("pub(crate) async fn begin_transaction(")
+        .expect("observability must expose attributed transaction acquisition")
+        .1
+        .split_once("pub(crate) async fn observe_advisory_lock")
+        .expect("transaction acquisition must precede advisory-lock observation")
+        .0;
+    assert!(legacy_transaction.contains("acquire_writer_with_legacy_metrics("));
 
     let runtime = include_str!("../src/runtime/mod.rs");
     assert!(runtime.contains("observability::acquire_writer_until("));
@@ -103,6 +111,40 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(runtime.contains("WriterOperation::EventWrite"));
     assert!(runtime.contains("ReaderOperation::Bootstrap"));
     assert!(runtime.contains("pub async fn begin_event_write_transaction"));
+    let reader_boot = runtime
+        .split_once("async fn read_pool_boot_ping_once(")
+        .expect("runtime must expose the reader boot probe")
+        .1
+        .split_once("#[cfg(test)]")
+        .expect("reader boot probe must precede its test seam")
+        .0;
+    assert!(reader_boot.contains("acquire_reader_with_legacy_metrics("));
+    let routed_reader = runtime
+        .split_once("async fn proved_reader(")
+        .expect("runtime must expose the routed-reader checkout")
+        .1
+        .split_once("async fn reader_aurora_capability_on(")
+        .expect("routed-reader checkout must precede capability probing")
+        .0;
+    assert!(routed_reader.contains("acquire_reader_with_legacy_metrics(read_pool, operation)"));
+    let event_write_transaction = runtime
+        .split_once("pub async fn begin_event_write_transaction(")
+        .expect("runtime must expose the legacy event-write transaction seam")
+        .1
+        .split_once("pub async fn insert_event_with_serving_write_guard(")
+        .expect("legacy event-write transaction must precede guarded writes")
+        .0;
+    assert!(event_write_transaction.contains("acquire_writer_with_legacy_metrics("));
+
+    let migration = include_str!("../src/runtime/migration.rs");
+    let migration_lock = migration
+        .split_once("pub(crate) async fn with_exclusive_schema_destruction_lock")
+        .expect("migration must expose the schema-safety acquisition seam")
+        .1
+        .split_once("async fn reject_legacy_nip_rs_cardinality_ambiguity")
+        .expect("schema-safety acquisition must precede migration validation")
+        .0;
+    assert!(migration_lock.contains("acquire_writer_with_legacy_metrics("));
 
     let allowlist = include_str!("../src/store/allowlist.rs");
     assert!(allowlist.contains("WriterOperation::Authentication"));
@@ -136,6 +178,7 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     let side_effects = include_str!("../../buzz-relay/src/handlers/side_effects.rs");
     assert!(side_effects.contains("query_events_for_event_write"));
     assert!(side_effects.contains("query_events_for_bootstrap"));
+    assert!(side_effects.contains(".list_channels_for_bootstrap("));
 
     let thread = include_str!("../src/store/thread.rs");
     let thread_metadata = thread
@@ -220,6 +263,17 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(get_channel.contains("fetch_optional(&mut *connection)"));
     assert!(!get_channel.contains("fetch_optional(pool)"));
     assert!(channel.contains("pub async fn get_channel_for_event_write("));
+    let list_channels = channel
+        .split_once("async fn list_channels_with_operation(")
+        .expect("channel listing must accept caller-owned intent")
+        .1
+        .split_once("/// A channel archived by the ephemeral-channel reaper")
+        .expect("channel listing must precede ephemeral-channel types")
+        .0;
+    assert!(list_channels.contains("acquire_writer(pool, operation)"));
+    assert!(list_channels.contains("fetch_all(&mut *connection)"));
+    assert!(!list_channels.contains("fetch_all(pool)"));
+    assert!(channel.contains("pub async fn list_channels_for_bootstrap("));
 
     let channel_members = include_str!("../src/store/channel_members.rs");
     assert!(channel_members.contains("async fn get_members_with_operation("));
@@ -401,6 +455,14 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
         .split("\n#[cfg(test)]")
         .next()
         .expect("usage production source");
+    let usage_leader_lock = usage_production
+        .split_once("pub async fn try_lock_usage_metrics(")
+        .expect("usage store must expose the legacy leader-lock acquisition")
+        .1
+        .split_once("pub async fn usage_community_count(")
+        .expect("usage leader lock must precede counter reads")
+        .0;
+    assert!(usage_leader_lock.contains("acquire_writer_with_legacy_metrics("));
     assert!(
         usage_production
             .matches("WriterOperation::Maintenance")
