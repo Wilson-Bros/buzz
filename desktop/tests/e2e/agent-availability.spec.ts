@@ -146,7 +146,7 @@ test("missing snapshot is offline but failed reads cannot reuse cached online", 
     w.__TAURI_INTERNALS__.invoke = async (command, payload, options) => {
       if (command === "get_presence") {
         if (w.__AVAILABILITY_RESPONSE__ === "error")
-          throw new Error("Presence fixture: relay read failed");
+          throw "relay unreachable: request timed out"; // Native Result::Err IPC shape
         if (w.__AVAILABILITY_RESPONSE__ === "missing") return {};
         if (w.__AVAILABILITY_RESPONSE__ === "online") {
           return Object.fromEntries(
@@ -348,3 +348,98 @@ test("member menu cannot start a present stopped local runtime", async ({
     )
     .toBe(1);
 });
+
+for (const surface of ["agents", "members"] as const) {
+  test(`${surface}: three rows and their actions share one presence request`, async ({
+    page,
+  }) => {
+    const keys = [LOCAL, "e".repeat(64), "f".repeat(64)];
+    await installMockBridge(page, {
+      managedAgents: keys.map((pubkey, index) => ({
+        pubkey,
+        name: `Shared snapshot ${index}`,
+        status: "running" as const,
+        channelNames: ["agents"],
+      })),
+    });
+    await page.goto(surface === "agents" ? "/#/agents" : "/");
+    if (surface === "members") {
+      await page.getByTestId("channel-agents").click();
+      await page.getByTestId("channel-members-trigger").click();
+    }
+    for (const pubkey of keys) {
+      await expect(
+        page.getByTestId(
+          surface === "agents"
+            ? `managed-agent-${pubkey}`
+            : `sidebar-member-${pubkey}`,
+        ),
+      ).toBeVisible();
+    }
+    // Count requests at the actual IPC boundary. Refresh every active presence
+    // observer so a hidden per-row/action query cannot escape the assertion.
+    const calls = await page.evaluate(async (keys) => {
+      const w = window as typeof window & {
+        __TAURI_INTERNALS__: {
+          invoke: (
+            command: string,
+            payload: unknown,
+            options: unknown,
+          ) => Promise<unknown>;
+        };
+        __BUZZ_E2E_QUERY_CLIENT__: {
+          invalidateQueries: (filter: { queryKey: string[] }) => Promise<void>;
+        };
+      };
+      const calls: string[][] = [];
+      const original = w.__TAURI_INTERNALS__.invoke;
+      w.__TAURI_INTERNALS__.invoke = (command, payload, options) => {
+        if (command === "get_presence") {
+          const pubkeys = (payload as { pubkeys: string[] }).pubkeys;
+          if (pubkeys.some((key) => keys.includes(key))) calls.push(pubkeys);
+        }
+        return original(command, payload, options);
+      };
+      try {
+        await w.__BUZZ_E2E_QUERY_CLIENT__.invalidateQueries({
+          queryKey: ["presence"],
+        });
+      } finally {
+        w.__TAURI_INTERNALS__.invoke = original;
+      }
+      return calls;
+    }, keys);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual(expect.arrayContaining(keys));
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+            channelName: "agents",
+            kind: 20001,
+          }),
+        ),
+      )
+      .toBe(true);
+    await page.evaluate(
+      (pubkey) =>
+        window.__BUZZ_E2E_EMIT_MOCK_PRESENCE__?.({ pubkey, status: "away" }),
+      LOCAL,
+    );
+    if (surface === "agents") {
+      await expect(
+        page.getByTestId(`agent-runtime-active-${LOCAL}`),
+      ).toHaveAttribute("aria-label", "Shared snapshot 0: Away");
+      await expect(
+        page.getByTestId(`agent-runtime-active-${keys[1]}`),
+      ).toHaveAttribute("aria-label", "Shared snapshot 1: Offline");
+    } else {
+      await expect(
+        page.getByTestId(`sidebar-member-presence-${LOCAL}`).locator("span"),
+      ).toHaveClass(/bg-amber-500/);
+      await expect(
+        page.getByTestId(`sidebar-member-presence-${keys[1]}`).locator("span"),
+      ).toHaveClass(/bg-muted-foreground/);
+    }
+  });
+}

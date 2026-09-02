@@ -8,7 +8,7 @@ import {
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { effectiveAgentDescription } from "@/features/agents/lib/agentDescription";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
-import { useAgentAvailability } from "@/features/agents/lib/useAgentAvailability";
+import type { AgentAvailabilityReader } from "@/features/agents/lib/useAgentAvailability";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { pickProfileAgent } from "@/features/agents/lib/pickProfileAgent";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
@@ -26,6 +26,7 @@ import { buildUnifiedGroups } from "./unifiedAgentGroups";
 
 type UnifiedAgentsSectionProps = {
   defaultModel: string;
+  getAvailability: AgentAvailabilityReader;
   actionErrorMessage: string | null;
   actionNoticeMessage: string | null;
   agents: ManagedAgent[];
@@ -71,6 +72,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     actionErrorMessage,
     actionNoticeMessage,
     defaultModel,
+    getAvailability,
     agents,
     agentsError,
     isActionPending,
@@ -154,6 +156,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                     />
                   )}
                   agent={profileAgent}
+                  getAvailability={getAvailability}
                   defaultModel={defaultModel}
                   key={group.persona.id}
                   persona={group.persona}
@@ -174,6 +177,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
             <CollapsibleAgentGroup
               agents={unknown}
               collapsed={collapsed}
+              getAvailability={getAvailability}
               defaultModel={defaultModel}
               groupKey="__unknown__"
               label="Unknown agents"
@@ -189,6 +193,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
             <CollapsibleAgentGroup
               agents={ungrouped}
               collapsed={collapsed}
+              getAvailability={getAvailability}
               defaultModel={defaultModel}
               groupKey="__ungrouped__"
               label="Custom agents"
@@ -225,6 +230,7 @@ function AgentPersonaCard({
   actions,
   agent,
   defaultModel,
+  getAvailability,
   persona,
   restartingAgentPubkey,
   startingAgentPubkey,
@@ -241,6 +247,7 @@ function AgentPersonaCard({
   ) => React.ReactNode;
   agent: ManagedAgent | undefined;
   defaultModel: string;
+  getAvailability: AgentAvailabilityReader;
   persona: AgentPersona;
   restartingAgentPubkey: string | null;
   startingAgentPubkey: string | null;
@@ -254,7 +261,7 @@ function AgentPersonaCard({
   onStartAgent: (pubkey: string) => void;
   onStartPersona: (persona: AgentPersona) => void;
 }) {
-  const { status: availability } = useAgentAvailability(agent?.pubkey);
+  const availability = getAvailability(agent?.pubkey);
   const title = persona.displayName;
   // Card face second line: the authored description when one exists;
   // otherwise fall back to the model label as before.
@@ -348,6 +355,7 @@ function AgentPersonaCard({
 function StandaloneAgentCard({
   agent,
   defaultModel,
+  getAvailability,
   restartingAgentPubkey,
   startingAgentPubkey,
   onOpenAgentProfile,
@@ -356,6 +364,7 @@ function StandaloneAgentCard({
 }: {
   agent: ManagedAgent;
   defaultModel: string;
+  getAvailability: AgentAvailabilityReader;
   restartingAgentPubkey: string | null;
   startingAgentPubkey: string | null;
   onOpenAgentProfile: (
@@ -365,7 +374,7 @@ function StandaloneAgentCard({
   onRestartAgent: (pubkey: string) => void;
   onStartAgent: (pubkey: string) => void;
 }) {
-  const { status: availability } = useAgentAvailability(agent.pubkey);
+  const availability = getAvailability(agent.pubkey);
   const title = agent.name;
   const profileQuery = useUserProfileQuery(agent.pubkey);
   const friendlyError = friendlyAgentLastError(
@@ -457,6 +466,7 @@ function CollapsibleAgentGroup({
   agents,
   collapsed,
   defaultModel,
+  getAvailability,
   restartingAgentPubkey,
   startingAgentPubkey,
   onToggle,
@@ -469,6 +479,7 @@ function CollapsibleAgentGroup({
   agents: ManagedAgent[];
   collapsed: ReadonlySet<string>;
   defaultModel: string;
+  getAvailability: AgentAvailabilityReader;
   restartingAgentPubkey: string | null;
   startingAgentPubkey: string | null;
   onToggle: (key: string) => void;
@@ -500,6 +511,7 @@ function CollapsibleAgentGroup({
           {agents.map((agent) => (
             <StandaloneAgentCard
               agent={agent}
+              getAvailability={getAvailability}
               defaultModel={defaultModel}
               key={agent.pubkey}
               restartingAgentPubkey={restartingAgentPubkey}

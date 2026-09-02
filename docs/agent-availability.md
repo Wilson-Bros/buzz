@@ -7,6 +7,14 @@ Offline. A pending/failed read or disconnected relay means unknown, including
 when the cache previously contained Online. Online and Away require presence.
 
 Agents cards and profiles share the existing presence query and live subscription;
+the Agents action owner queries its full managed set once and passes its reader
+to persona/custom/unknown cards. Members owns one full-roster query shared by
+rows, menus and bulk actions. The profile's actions use its existing snapshot,
+and its popover also preserves failed/disconnected reads as unknown. Native
+query errors reject the IPC call rather than fabricating an empty snapshot.
+A live update or self heartbeat cannot heal a failed aggregate snapshot by
+marking cached siblings successful; those reads remain unknown until a
+successful snapshot retry. No per-row polling is needed, and
 there is no second availability cache or substrate poller. Lifecycle controls
 remain separate: a deployed provider agent still offers Shutdown while offline.
 Shutdown sends a request, not a confirmed termination, and absence of presence
@@ -27,6 +35,15 @@ is introduced. Runtime details remain accessible through the card/profile.
 
 
 ## Regression evidence
+
+- `desktop/src-tauri/src/commands/profile_presence_tests.rs`: actual command
+  against loopback HTTP; empty success versus auth/rate-limit/storage/malformed
+  response and transport failure, with authenticated kind-20001 requests.
+- `UnifiedAgentsSectionCardTarget.test.mjs`: three card types use one request
+  and one polling observer, reordered while the snapshot is in flight; exact-key
+  live updates, failed warm-cache poll, retry, changed author set and unmount.
+- `agent-availability.spec.ts`: real Agents/Members surfaces request-count check;
+  failure uses the native string rejection shape, not a fabricated success.
 
 - `desktop/src/features/agents/lib/useAgentAvailability.test.mjs`: successful,
   missing, unavailable, and disconnected presence; lifecycle routing and badges.

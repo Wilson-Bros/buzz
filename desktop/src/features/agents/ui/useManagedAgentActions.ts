@@ -16,13 +16,11 @@ import {
 } from "@/features/agents/hooks";
 import {
   agentPresenceStartBlockReason,
-  resolveAgentAvailability,
+  useAgentAvailabilityLookup,
 } from "../lib/useAgentAvailability";
-import { useRelayConnection } from "@/shared/api/useRelayConnection";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { invalidateChannelMembersRosters } from "@/features/channels/rosterFreshness";
-import { usePresenceQuery } from "@/features/presence/hooks";
 import type { AgentPersona, Channel, ManagedAgent } from "@/shared/api/types";
 import { removeChannelMember } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -106,17 +104,13 @@ export function useManagedAgentActions() {
     [managedAgents],
   );
 
-  const managedPresenceQuery = usePresenceQuery(managedPubkeyList);
-  const relayConnection = useRelayConnection();
+  const { query: managedPresenceQuery, getAvailability } =
+    useAgentAvailabilityLookup(managedPubkeyList);
 
   function assertStartNotBlockedByPresence(agent: ManagedAgent) {
     const reason = agentPresenceStartBlockReason(
       isManagedAgentActive(agent),
-      resolveAgentAvailability(
-        managedPresenceQuery.data?.[normalizePubkey(agent.pubkey)],
-        managedPresenceQuery.isSuccess,
-        relayConnection === "connected",
-      ),
+      getAvailability(agent.pubkey),
     );
     if (reason) throw new Error(reason);
   }
@@ -449,6 +443,7 @@ export function useManagedAgentActions() {
     managedAgentsQuery,
     managedAgentLogQuery,
     managedPresenceQuery,
+    getAvailability,
     managedAgents,
     managedPubkeys,
     channelIdToName,

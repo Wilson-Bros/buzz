@@ -1,3 +1,4 @@
+import * as React from "react";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import type { PresenceStatus } from "@/shared/api/types";
 import { useRelayConnection } from "@/shared/api/useRelayConnection";
@@ -27,14 +28,36 @@ export function agentPresenceStartBlockReason(
     : undefined;
 }
 
-/** Share the existing presence query/subscription; no separate status cache. */
-export function useAgentAvailability(pubkey: string | null | undefined) {
-  const query = usePresenceQuery(pubkey ? [pubkey] : []);
+/** Read availability from the surface-owned snapshot, not per-row polling. */
+export type AgentAvailabilityReader = (
+  pubkey: string | null | undefined,
+) => PresenceStatus | undefined;
+
+/** One query/connection observer for a surface's cards and lifecycle actions. */
+export function useAgentAvailabilityLookup(
+  pubkeys: string[],
+  options?: { enabled?: boolean },
+) {
+  const query = usePresenceQuery(pubkeys, options);
   const connection = useRelayConnection();
-  const status = resolveAgentAvailability(
-    pubkey ? query.data?.[normalizePubkey(pubkey)] : undefined,
-    query.isSuccess,
-    connection === "connected",
+  const getAvailability: AgentAvailabilityReader = React.useCallback(
+    (pubkey) =>
+      pubkey
+        ? resolveAgentAvailability(
+            query.data?.[normalizePubkey(pubkey)],
+            query.isSuccess,
+            connection === "connected",
+          )
+        : undefined,
+    [query.data, query.isSuccess, connection],
   );
-  return { query, status };
+  return { query, getAvailability };
+}
+
+/** Single-identity surfaces use the same authority as aggregate surfaces. */
+export function useAgentAvailability(pubkey: string | null | undefined) {
+  const { query, getAvailability } = useAgentAvailabilityLookup(
+    pubkey ? [pubkey] : [],
+  );
+  return { query, status: getAvailability(pubkey) };
 }

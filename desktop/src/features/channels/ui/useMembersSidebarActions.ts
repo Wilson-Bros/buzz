@@ -1,10 +1,7 @@
 import {
   agentPresenceStartBlockReason,
-  resolveAgentAvailability,
+  type AgentAvailabilityReader,
 } from "@/features/agents/lib/useAgentAvailability";
-import { usePresenceQuery } from "@/features/presence/hooks";
-import { useRelayConnection } from "@/shared/api/useRelayConnection";
-import { normalizePubkey } from "@/shared/lib/pubkey";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -36,6 +33,7 @@ import type {
 
 type UseMembersSidebarActionsOptions = {
   channelId: string | null;
+  getAvailability: AgentAvailabilityReader;
   controllableManagedBots: readonly ManagedAgent[];
   removableManagedBots: readonly ManagedAgent[];
   currentPubkey?: string;
@@ -56,6 +54,7 @@ const EMPTY_AGENT_CONTEXT = {
 
 export function useMembersSidebarActions({
   channelId,
+  getAvailability,
   controllableManagedBots,
   removableManagedBots,
   currentPubkey,
@@ -63,21 +62,13 @@ export function useMembersSidebarActions({
   relayUrl,
 }: UseMembersSidebarActionsOptions) {
   const queryClient = useQueryClient();
-  const presenceQuery = usePresenceQuery(
-    controllableManagedBots.map((agent) => agent.pubkey),
-  );
-  const connection = useRelayConnection();
   function assertStartNotBlockedByPresence(
     agent: ManagedAgent,
     lifecycleActive: boolean,
   ) {
     const reason = agentPresenceStartBlockReason(
       lifecycleActive,
-      resolveAgentAvailability(
-        presenceQuery.data?.[normalizePubkey(agent.pubkey)],
-        presenceQuery.isSuccess,
-        connection === "connected",
-      ),
+      getAvailability(agent.pubkey),
     );
     if (reason) throw new Error(reason);
   }

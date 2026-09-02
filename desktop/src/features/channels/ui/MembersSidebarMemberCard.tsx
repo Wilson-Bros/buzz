@@ -1,7 +1,4 @@
-import {
-  agentPresenceStartBlockReason,
-  useAgentAvailability,
-} from "@/features/agents/lib/useAgentAvailability";
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import {
   Activity,
   Ban,
@@ -297,6 +294,7 @@ export function MembersSidebarMemberCard({
           onUntimeout={onUntimeout}
           onViewActivity={onViewActivity}
           pairAction={pairAction}
+          availability={presenceStatus ?? undefined}
         />
       ) : null}
     </div>
@@ -306,6 +304,7 @@ export function MembersSidebarMemberCard({
 const PEOPLE_ROLES = ["admin", "member", "guest"] as const;
 
 function MemberActionsMenu({
+  availability,
   canChangeRole,
   canModerateMember,
   canRemoveMember,
@@ -327,6 +326,7 @@ function MemberActionsMenu({
   pairAction,
 }: {
   canChangeRole: boolean;
+  availability: PresenceStatus | undefined;
   canModerateMember: boolean;
   canRemoveMember: boolean;
   canViewActivity: boolean;
@@ -351,7 +351,6 @@ function MemberActionsMenu({
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
 
-  const { status: availability } = useAgentAvailability(managedAgent?.pubkey);
   const startBlockReason = managedAgent
     ? agentPresenceStartBlockReason(
         pairAction ? pairAction === "stop" : isManagedAgentActive(managedAgent),

@@ -7,27 +7,30 @@ import {
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
-import {
-  agentPresenceStartBlockReason,
-  useAgentAvailability,
-} from "@/features/agents/lib/useAgentAvailability";
+import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import { clearActiveTurnsForAgentOnStop } from "@/features/agents/managedAgentRuntimeHooks";
-import type { Channel, ManagedAgent, RelayAgent } from "@/shared/api/types";
+import type {
+  Channel,
+  ManagedAgent,
+  RelayAgent,
+  PresenceStatus,
+} from "@/shared/api/types";
 
 export function useAgentLifecycleActions({
+  availability,
   channels,
   managedAgent,
   relayAgents,
   startManagedAgent,
   stopManagedAgent,
 }: {
+  availability: PresenceStatus | undefined;
   channels: readonly Channel[] | undefined;
   managedAgent: ManagedAgent | undefined;
   relayAgents: readonly RelayAgent[] | undefined;
   startManagedAgent: (pubkey: string) => Promise<unknown>;
   stopManagedAgent: (pubkey: string) => Promise<unknown>;
 }) {
-  const { status: availability } = useAgentAvailability(managedAgent?.pubkey);
   const handleAgentPrimaryAction = React.useCallback(async () => {
     if (!managedAgent) return;
 
