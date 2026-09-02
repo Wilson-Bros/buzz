@@ -382,7 +382,7 @@ function UserProfilePopoverBody({
         label={displayName}
         shape={isBotProfile ? "squircle" : "circle"}
         size={40}
-        status={presenceStatus ?? "offline"}
+        status={presenceStatus}
         statusTestId="user-profile-popover-presence-badge"
         testId="user-profile-popover-avatar"
       />

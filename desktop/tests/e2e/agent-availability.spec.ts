@@ -443,3 +443,152 @@ for (const surface of ["agents", "members"] as const) {
     }
   });
 }
+
+test("hover profile preserves unknown availability and announces only established status", async ({
+  page,
+}) => {
+  const pubkey =
+    "554cef57437abac34522ac2c9f0490d685b72c80478cf9f7ed6f9570ee8624ea";
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey,
+        name: "Charlie",
+        status: "running",
+        channelNames: ["agents"],
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-agents").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("agents");
+
+  // Hold the actual single-key IPC read pending before opening the lazy hover
+  // body. Do not mock the availability hook, avatar or rendered query state.
+  await page.evaluate((pubkey) => {
+    const w = window as typeof window & {
+      __POPOVER_RESPONSE__?:
+        | "pending"
+        | "missing"
+        | "offline"
+        | "online"
+        | "error";
+      __POPOVER_RELEASE__?: () => void;
+      __TAURI_INTERNALS__: {
+        invoke: (
+          command: string,
+          payload: unknown,
+          options: unknown,
+        ) => Promise<unknown>;
+      };
+    };
+    w.__POPOVER_RESPONSE__ = "pending";
+    const original = w.__TAURI_INTERNALS__.invoke.bind(w.__TAURI_INTERNALS__);
+    w.__TAURI_INTERNALS__.invoke = async (command, payload, options) => {
+      const keys = (payload as { pubkeys?: string[] } | undefined)?.pubkeys;
+      if (
+        command === "get_presence" &&
+        keys?.length === 1 &&
+        keys[0] === pubkey
+      ) {
+        if (w.__POPOVER_RESPONSE__ === "pending") {
+          await new Promise<void>((resolve) => {
+            w.__POPOVER_RELEASE__ = resolve;
+          });
+        }
+        if (w.__POPOVER_RESPONSE__ === "error") {
+          throw "relay unreachable: request timed out"; // Native Result::Err IPC shape
+        }
+        if (w.__POPOVER_RESPONSE__ === "missing") return {};
+        return { [pubkey]: w.__POPOVER_RESPONSE__ };
+      }
+      return original(command, payload, options);
+    };
+  }, pubkey);
+
+  await page
+    .getByTestId("message-row")
+    .filter({ hasText: "Indexing the channel catalog now." })
+    .getByRole("button")
+    .first()
+    .hover();
+  const popover = page.getByTestId("user-profile-popover");
+  const badge = popover.getByTestId("user-profile-popover-presence-badge");
+  await expect(popover).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          typeof (window as typeof window & { __POPOVER_RELEASE__?: unknown })
+            .__POPOVER_RELEASE__,
+      ),
+    )
+    .toBe("function");
+
+  async function expectUnknown() {
+    await expect(badge).toHaveCount(0);
+    await expect(
+      popover.getByRole("img", { name: /^(Offline|Online|Away)$/ }),
+    ).toHaveCount(0);
+    await expect(
+      popover
+        .locator(".sr-only")
+        .filter({ hasText: /^(Offline|Online|Away)$/ }),
+    ).toHaveCount(0);
+  }
+  async function expectStatus(label: string) {
+    await expect(badge).toBeVisible();
+    await expect(badge).toHaveAttribute("role", "img");
+    await expect(badge).toHaveAttribute("aria-label", label);
+    await expect(badge.locator(".sr-only")).toHaveText(label);
+  }
+  await expectUnknown();
+  await page.evaluate(() => {
+    const w = window as typeof window & {
+      __POPOVER_RESPONSE__?: string;
+      __POPOVER_RELEASE__?: () => void;
+    };
+    w.__POPOVER_RESPONSE__ = "missing";
+    w.__POPOVER_RELEASE__?.();
+  });
+  await expectStatus("Offline");
+
+  // Successful missing is distinct from explicit Offline, failure (including
+  // stale Online), and a disconnect after recovery. Keep the same popover open.
+  for (const response of [
+    "offline",
+    "online",
+    "error",
+    "missing",
+    "online",
+  ] as const) {
+    await page.evaluate(
+      async ({ response, pubkey }) => {
+        const w = window as typeof window & {
+          __POPOVER_RESPONSE__?: typeof response;
+          __BUZZ_E2E_QUERY_CLIENT__?: {
+            invalidateQueries: (filter: {
+              queryKey: string[];
+              exact: boolean;
+            }) => Promise<void>;
+          };
+        };
+        w.__POPOVER_RESPONSE__ = response;
+        if (!w.__BUZZ_E2E_QUERY_CLIENT__)
+          throw new Error("Query client unavailable");
+        await w.__BUZZ_E2E_QUERY_CLIENT__.invalidateQueries({
+          queryKey: ["presence", pubkey],
+          exact: true,
+        });
+      },
+      { response, pubkey },
+    );
+    if (response === "error") await expectUnknown();
+    else await expectStatus(response === "online" ? "Online" : "Offline");
+  }
+  await page.evaluate(() =>
+    window.__BUZZ_E2E_SET_RELAY_CONNECTION_STATE__?.("disconnected"),
+  );
+  await expectUnknown();
+  await expect(popover).toBeVisible();
+});

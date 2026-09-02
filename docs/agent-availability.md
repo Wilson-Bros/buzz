@@ -50,7 +50,11 @@ is introduced. Runtime details remain accessible through the card/profile.
 - `desktop/tests/e2e/agent-availability.spec.ts`: deployed/offline profile and
   card, stopped/Online and Away presence, disabled keyboard/click Start in
   profile and member menu, restored Offline startup, running-but-Offline,
-  live updates and disconnected-state behavior.
+  live updates and disconnected-state behavior. Its real hover-popover journey
+  holds the single-key IPC read pending, then distinguishes successful omission
+  and explicit Offline from failed cached Online and disconnection, checking
+  visible badges plus accessible names and screen-reader status text. Restoring
+  the popover's Offline fallback must fail this regression.
 - `desktop/src/features/agents/ui/UnifiedAgentsSectionCardTarget.test.mjs`:
   mounted persona/custom/unknown cards, exact-key versus other-key presence,
   Online/Away/offline/missing transitions and actual Start callback activation.
