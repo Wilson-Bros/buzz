@@ -1,4 +1,7 @@
-import { isMentionActionable } from "./mentionPresentation";
+import {
+  isMentionActionable,
+  markMentionCollisions,
+} from "./mentionPresentation";
 import * as React from "react";
 import {
   useManagedAgentsQuery,
@@ -13,7 +16,6 @@ import {
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import type { MentionSuggestion } from "@/features/messages/ui/MentionAutocomplete";
 import {
-  filterCachedAgentSuggestions,
   getAgentIdentityPubkeys,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
@@ -30,7 +32,7 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import type { AutocompleteEdit } from "./useRichTextEditor";
 import type { ChannelMember, ChannelType } from "@/shared/api/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
-import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
+import { useMentionQuery } from "./useMentionQuery";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 import { useActiveAgentPubkeys } from "./useActiveAgentPubkeys";
@@ -63,11 +65,12 @@ import {
   type MentionCandidate,
 } from "./mentionCandidates";
 import { buildMentionCandidates } from "./buildMentionCandidates";
-const MENTION_DEBOUNCE_MS = 120,
-  MENTION_SUGGESTION_LIMIT = 50;
+const MENTION_SUGGESTION_LIMIT = 50;
 type UseMentionsOptions = {
   channelType?: ChannelType | null;
   recentMentionPubkeys?: readonly string[];
+  /** Read document and selection from one live editor state at commit time. */
+  getEditorSnapshot?: () => { text: string; cursor: number };
 };
 export function useMentions(
   channelId: string | null,
@@ -75,11 +78,25 @@ export function useMentions(
   profiles?: UserProfileLookup,
   options?: UseMentionsOptions,
 ) {
-  const [mentionQuery, setMentionQuery] = React.useState<string | null>(null);
-  const [mentionStartIndex, setMentionStartIndex] = React.useState(0);
-  const mentionPickerOriginRef = React.useRef<"inline" | "explicit" | null>(
-    null,
+  const identityQuery = useIdentityQuery();
+  const currentPubkey = identityQuery.data?.pubkey
+    ? normalizePubkey(identityQuery.data.pubkey)
+    : null;
+  const admissionScope = React.useMemo(
+    () => ({ currentPubkey, channelId }),
+    [currentPubkey, channelId],
   );
+  const query = useMentionQuery(options?.getEditorSnapshot, admissionScope);
+  const mentionQuery = query.context?.query ?? null;
+  const mentionStartIndex = query.context?.startIndex ?? 0;
+  const {
+    originRef: mentionPickerOriginRef,
+    latestValueRef,
+    latestCursorRef,
+    debounceTimerRef,
+    searchableNamesLowerRef,
+    currentPrefix: currentMentionPrefix,
+  } = query;
   const [selectedMentionNames, setSelectedMentionNames] = React.useState<
     string[]
   >([]);
@@ -90,13 +107,8 @@ export function useMentions(
   selectedAgentMentionNamesRef.current = selectedAgentMentionNames;
   const mentionMapRef = React.useRef<Map<string, string>>(new Map());
   const personaMentionMapRef = React.useRef<Map<string, string>>(new Map());
-  const previousSuggestionsRef = React.useRef<MentionSuggestion[]>([]);
   const mentionSearchQuery = mentionQuery?.trim() ?? "";
   const canSearchGlobalPeople = mentionSearchQuery.length > 0;
-  const identityQuery = useIdentityQuery();
-  const currentPubkey = identityQuery.data?.pubkey
-    ? normalizePubkey(identityQuery.data.pubkey)
-    : null;
   const membersQuery = useChannelMembersQuery(channelId);
   const members = externalMembers ?? membersQuery.data;
   const isArchivedDiscovery = useIsArchivedPredicate();
@@ -297,14 +309,15 @@ export function useMentions(
     ],
   );
   const mentionCandidatesWithTeams = React.useMemo(
-    () => [
-      ...mentionCandidates,
-      ...buildTeamMentionCandidates(
-        teamsQuery.data ?? [],
-        personasQuery.data ?? [],
-        mentionCandidates,
-      ),
-    ],
+    () =>
+      markMentionCollisions([
+        ...mentionCandidates,
+        ...buildTeamMentionCandidates(
+          teamsQuery.data ?? [],
+          personasQuery.data ?? [],
+          mentionCandidates,
+        ),
+      ]),
     [mentionCandidates, personasQuery.data, teamsQuery.data],
   );
   const ownerPubkeys = React.useMemo(
@@ -352,22 +365,7 @@ export function useMentions(
     () => searchableNames.map((n) => n.toLowerCase()),
     [searchableNames],
   );
-  const debounceTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
-  const latestValueRef = React.useRef<string>("");
-  const latestCursorRef = React.useRef<number>(0);
-  const flushedMentionStartIndexRef = React.useRef<number | null>(null);
-  const searchableNamesLowerRef = React.useRef<string[]>(searchableNamesLower);
   searchableNamesLowerRef.current = searchableNamesLower;
-  React.useEffect(
-    () => () => {
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-      }
-    },
-    [],
-  );
   const matchingSuggestions = React.useMemo<MentionSuggestion[]>(() => {
     if (mentionQuery === null) {
       return [];
@@ -379,15 +377,17 @@ export function useMentions(
     )
       .slice(0, MENTION_SUGGESTION_LIMIT)
       .map(({ candidate, label }) =>
-        mapMentionCandidateToSuggestion({
-          agentProvenanceReady: agentDirectoriesReady,
-          candidate,
-          label,
-          channelType: options?.channelType,
-          currentPubkey,
-          ownerProfiles: ownerProfilesQuery.data?.profiles,
-          profiles,
-        }),
+        query.bind(
+          mapMentionCandidateToSuggestion({
+            agentProvenanceReady: agentDirectoriesReady,
+            candidate,
+            label,
+            channelType: options?.channelType,
+            currentPubkey,
+            ownerProfiles: ownerProfilesQuery.data?.profiles,
+            profiles,
+          }),
+        ),
       );
   }, [
     activePersonaIds,
@@ -395,11 +395,12 @@ export function useMentions(
     currentPubkey,
     mentionCandidatesWithTeams,
     mentionQuery,
+    query.bind,
     options?.channelType,
     ownerProfilesQuery.data?.profiles,
     profiles,
   ]);
-  const getDefaultAgentSuggestion = useDefaultAgentSuggestion({
+  const defaultAgentSuggestion = useDefaultAgentSuggestion({
     activePersonaIds,
     agentProvenanceReady: agentDirectoriesReady,
     candidates: mentionCandidates,
@@ -409,6 +410,10 @@ export function useMentions(
     profiles,
     recentMentionPubkeys: options?.recentMentionPubkeys,
   });
+  const getDefaultAgentSuggestion = React.useCallback(
+    () => query.bindDefault(defaultAgentSuggestion()),
+    [query.bindDefault, defaultAgentSuggestion],
+  );
   const fetchMoreSuggestions = React.useCallback(() => {
     if (userSearchQuery.hasNextPage && !userSearchQuery.isFetchingNextPage) {
       void userSearchQuery.fetchNextPage();
@@ -421,40 +426,16 @@ export function useMentions(
     if (matchingSuggestions.length > 0) {
       return matchingSuggestions;
     }
-    if (userSearchQuery.isFetching) {
-      return filterCachedAgentSuggestions(
-        previousSuggestionsRef.current,
-        mentionCandidatesWithTeams,
-      );
-    }
     return [];
-  }, [
-    matchingSuggestions,
-    mentionCandidatesWithTeams,
-    mentionQuery,
-    userSearchQuery.isFetching,
-  ]);
-  React.useEffect(() => {
-    if (mentionQuery === null) {
-      previousSuggestionsRef.current = [];
-      return;
-    }
-    if (matchingSuggestions.length > 0) {
-      previousSuggestionsRef.current = matchingSuggestions;
-    } else if (!userSearchQuery.isFetching) {
-      previousSuggestionsRef.current = [];
-    }
-  }, [matchingSuggestions, mentionQuery, userSearchQuery.isFetching]);
+  }, [matchingSuggestions, mentionQuery]);
   const mentionSelection = useMentionSelection(suggestions);
+  query.clearSelectionRef.current =
+    mentionSelection.clearAgentSelectionPreference;
   const { mentionSelectedIndex, setMentionSelectedIndex: setSelected } =
     mentionSelection;
   const isMentionOpen = mentionQuery !== null && suggestions.length > 0;
   // Recheck against this render's exact-key evidence even if a child retained
   // an older row/callback. A rejected selection must not establish draft intent.
-  const admissionScope = React.useMemo(
-    () => ({ currentPubkey, channelId }),
-    [currentPubkey, channelId],
-  );
   const admissionRef = React.useRef({
     scope: admissionScope,
     candidates: mentionCandidatesWithTeams,
@@ -475,6 +456,7 @@ export function useMentions(
       );
       return (
         admissionRef.current.scope === admissionScope &&
+        query.canCommit(suggestion) &&
         !!current &&
         (current.kind !== "team" ||
           (suggestion.kind === "team" &&
@@ -504,7 +486,7 @@ export function useMentions(
         isMentionActionable(suggestion)
       );
     },
-    [admissionScope],
+    [admissionScope, query.canCommit],
   );
   const insertMention = React.useCallback(
     (suggestion: MentionSuggestion, selectionEnd: number): AutocompleteEdit => {
@@ -512,7 +494,14 @@ export function useMentions(
         clearTimeout(debounceTimerRef.current);
         debounceTimerRef.current = null;
       }
-      if (!canSelectMention(suggestion))
+      const prefix = currentMentionPrefix();
+      if (
+        !canSelectMention(suggestion) ||
+        (options?.getEditorSnapshot &&
+          selectionEnd !== latestCursorRef.current) ||
+        (prefix && prefix.startIndex > selectionEnd) ||
+        (!prefix && mentionPickerOriginRef.current !== "explicit")
+      )
         return {
           replaceFromOffset: selectionEnd,
           replaceToOffset: selectionEnd,
@@ -578,19 +567,24 @@ export function useMentions(
       }
       trimMapToSize(mentions, 200);
       trimMapToSize(personaMentions, 200);
-      mentionPickerOriginRef.current = null;
-      setMentionQuery(null);
-      setSelected(0);
-      const startIndex =
-        flushedMentionStartIndexRef.current ?? mentionStartIndex;
-      flushedMentionStartIndexRef.current = null;
+      query.cancel();
+      const startIndex = prefix?.startIndex ?? selectionEnd;
       return {
         replaceFromOffset: startIndex,
         replaceToOffset: selectionEnd,
         insertText,
       };
     },
-    [canSelectMention, knownAgentPubkeys, mentionStartIndex, setSelected],
+    [
+      canSelectMention,
+      currentMentionPrefix,
+      knownAgentPubkeys,
+      options?.getEditorSnapshot,
+      query.cancel,
+      debounceTimerRef,
+      latestCursorRef,
+      mentionPickerOriginRef,
+    ],
   );
   const registerMentionPubkey = React.useCallback(
     (displayName: string, pubkey: string, options?: { isAgent?: boolean }) => {
@@ -671,69 +665,17 @@ export function useMentions(
   );
   const isInlineMentionSelection = React.useCallback(
     () => mentionPickerOriginRef.current === "inline",
-    [],
+    [mentionPickerOriginRef],
   );
-  const autocompleteGenerationRef = React.useRef(0);
-  const updateMentionQuery = React.useCallback(
-    (value: string, cursorPosition: number) => {
-      mentionSelection.clearAgentSelectionPreference();
-      const generation = ++autocompleteGenerationRef.current;
-      latestValueRef.current = value;
-      latestCursorRef.current = cursorPosition;
-      const activeInlineMention = detectPrefixQuery(
-        "@",
-        value,
-        cursorPosition,
-        searchableNamesLowerRef.current,
-      );
-      if (activeInlineMention) {
-        mentionPickerOriginRef.current = "inline";
-      } else if (mentionPickerOriginRef.current === "inline") {
-        mentionPickerOriginRef.current = null;
-      }
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-      }
-      debounceTimerRef.current = setTimeout(() => {
-        debounceTimerRef.current = null;
-        if (generation !== autocompleteGenerationRef.current) return;
-        const mention = detectPrefixQuery(
-          "@",
-          latestValueRef.current,
-          latestCursorRef.current,
-          searchableNamesLowerRef.current,
-        );
-        if (mention) {
-          mentionPickerOriginRef.current = "inline";
-          setMentionQuery(mention.query);
-          setMentionStartIndex(mention.startIndex);
-          setSelected(0);
-        } else {
-          setMentionQuery(null);
-        }
-      }, MENTION_DEBOUNCE_MS);
-    },
-    [mentionSelection.clearAgentSelectionPreference, setSelected],
-  );
+  const updateMentionQuery = query.update;
   const openMentionPicker = React.useCallback(
     (cursorPosition: number, preference: MentionPickerMode = null) => {
-      autocompleteGenerationRef.current += 1;
-      if (debounceTimerRef.current !== null) {
-        clearTimeout(debounceTimerRef.current);
-        debounceTimerRef.current = null;
-      }
-      flushedMentionStartIndexRef.current = null;
-      mentionPickerOriginRef.current = "explicit";
-      if (preference === "preserve") {
-        setMentionStartIndex(cursorPosition);
-        return;
-      }
+      query.open(cursorPosition, preference === "preserve");
+      if (preference === "preserve") return;
       mentionSelection.prepareSelectionPreference(preference);
-      setMentionQuery("");
-      setMentionStartIndex(cursorPosition);
       setSelected(0);
     },
-    [mentionSelection.prepareSelectionPreference, setSelected],
+    [mentionSelection.prepareSelectionPreference, query.open, setSelected],
   );
   const extractMentionPubkeysForCurrentMentions = React.useCallback(
     (text: string): string[] => {
@@ -778,18 +720,7 @@ export function useMentions(
       ),
     [activePersonaById, mentionCandidates],
   );
-  const cancelMentionAutocomplete = React.useCallback(() => {
-    autocompleteGenerationRef.current += 1;
-    if (debounceTimerRef.current !== null) {
-      clearTimeout(debounceTimerRef.current);
-      debounceTimerRef.current = null;
-    }
-    flushedMentionStartIndexRef.current = null;
-    mentionPickerOriginRef.current = null;
-    mentionSelection.clearAgentSelectionPreference();
-    setMentionQuery(null);
-    setSelected(0);
-  }, [mentionSelection.clearAgentSelectionPreference, setSelected]);
+  const cancelMentionAutocomplete = query.cancel;
   const clearMentions = React.useCallback(() => {
     cancelMentionAutocomplete();
     mentionMapRef.current.clear();
@@ -817,9 +748,20 @@ export function useMentions(
       // text must stay literal, so Space is left to the editor.
       opts?: { isCodeContext?: () => boolean },
     ): { handled: boolean; suggestion?: MentionSuggestion } => {
+      if (admissionRef.current.scope !== admissionScope)
+        return { handled: false };
       const exactMentionSpace =
         isPlainSpace(event.nativeEvent) && !opts?.isCodeContext?.();
       if (!isMentionOpen && !exactMentionSpace) return { handled: false };
+      if (
+        (event.key === "ArrowDown" || event.key === "ArrowUp") &&
+        !query.isCurrent()
+      ) {
+        event.preventDefault();
+        mentionSelection.clearAgentSelectionPreference();
+        query.refresh();
+        return { handled: true };
+      }
       if (event.key === "ArrowDown") {
         event.preventDefault();
         setSelected((current) =>
@@ -847,6 +789,30 @@ export function useMentions(
           !event.altKey &&
           !event.shiftKey)
       ) {
+        const prefix = currentMentionPrefix();
+        if (!prefix && mentionPickerOriginRef.current !== "explicit") {
+          cancelMentionAutocomplete();
+          return { handled: false };
+        }
+        if (
+          !(debounceTimerRef.current === null
+            ? query.isCurrent()
+            : query.canResolve())
+        ) {
+          mentionSelection.clearAgentSelectionPreference();
+          query.refresh();
+          if (!exactMentionSpace) event.preventDefault();
+          return { handled: !exactMentionSpace };
+        }
+        const chosen = suggestions[mentionSelectedIndex];
+        if (!exactMentionSpace && mentionSelection.hasDeliberateSelection) {
+          event.preventDefault();
+          if (!chosen || !canSelectMention(chosen)) return { handled: true };
+          if (debounceTimerRef.current !== null)
+            clearTimeout(debounceTimerRef.current);
+          debounceTimerRef.current = null;
+          return { handled: true, suggestion: chosen };
+        }
         if (debounceTimerRef.current !== null || exactMentionSpace) {
           const flushed = flushMentionDebounce({
             debounceTimerRef,
@@ -861,23 +827,46 @@ export function useMentions(
             ownerProfiles: ownerProfilesQuery.data?.profiles,
             profiles,
             requireExact: exactMentionSpace,
+            resultsIncomplete: (query) =>
+              query !== mentionSearchQuery.toLowerCase() ||
+              !canSearchGlobalUsers ||
+              !userSearchQuery.isSuccess ||
+              Boolean(
+                userSearchQuery.hasNextPage || userSearchQuery.isFetching,
+              ),
           });
+          if (flushed?.type === "needs-choice") {
+            query.refresh();
+            if (exactMentionSpace) return { handled: false };
+            event.preventDefault();
+            return { handled: true };
+          }
           if (exactMentionSpace && flushed?.type !== "match")
             return { handled: false };
           event.preventDefault();
           if (flushed?.type === "match") {
-            flushedMentionStartIndexRef.current = flushed.startIndex;
-            mentionPickerOriginRef.current = "inline";
-            setMentionQuery(null); // reset so dropdown closes
-            return { handled: true, suggestion: flushed.suggestion };
+            return {
+              handled: true,
+              suggestion: query.bindFresh(flushed.suggestion),
+            };
           }
           if (flushed?.type === "no-match") {
-            setMentionQuery(null);
+            cancelMentionAutocomplete();
             return { handled: true };
           }
         }
         event.preventDefault();
-        return { handled: true, suggestion: suggestions[mentionSelectedIndex] };
+        if (
+          !chosen ||
+          !canSelectMention(chosen) ||
+          (!mentionSelection.hasDeliberateSelection &&
+            (chosen.hasNameCollision ||
+              userSearchQuery.hasNextPage ||
+              userSearchQuery.isFetching ||
+              (canSearchGlobalPeople && !userSearchQuery.isSuccess)))
+        )
+          return { handled: true };
+        return { handled: true, suggestion: chosen };
       }
       if (event.key === "Escape") {
         event.preventDefault();
@@ -888,12 +877,29 @@ export function useMentions(
     },
     [
       activePersonaIds,
+      admissionScope,
       agentDirectoriesReady,
       cancelMentionAutocomplete,
+      canSelectMention,
+      currentMentionPrefix,
       currentPubkey,
       isMentionOpen,
+      query,
+      debounceTimerRef,
+      latestCursorRef,
+      latestValueRef,
+      mentionPickerOriginRef,
+      searchableNamesLowerRef,
       mentionCandidatesWithTeams,
       mentionSelectedIndex,
+      mentionSelection.hasDeliberateSelection,
+      mentionSelection.clearAgentSelectionPreference,
+      userSearchQuery.hasNextPage,
+      userSearchQuery.isFetching,
+      userSearchQuery.isSuccess,
+      canSearchGlobalPeople,
+      canSearchGlobalUsers,
+      mentionSearchQuery,
       options?.channelType,
       ownerProfilesQuery.data?.profiles,
       profiles,

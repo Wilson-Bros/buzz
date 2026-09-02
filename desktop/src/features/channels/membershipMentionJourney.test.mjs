@@ -71,7 +71,9 @@ const rawAgent = () => ({
 const invoke = async (command, args) => {
   if (command.startsWith("plugin:event|")) return 0;
   if (command === "search_users") {
-    return { users: [], next_cursor: null };
+    state.searchCalls += 1;
+    if (state.failSearch) throw new Error("Search unavailable");
+    return { users: state.searchUsers, next_cursor: state.nextCursor };
   }
   if (command === "get_identity") return { pubkey: VIEWER };
   if (command === "create_channel") return channel();
@@ -173,6 +175,9 @@ function Mutations() {
 function Composer() {
   mention = useMentions(state.channelId, undefined, undefined, {
     channelType: "stream",
+    getEditorSnapshot: state.editorSnapshot
+      ? () => state.editorSnapshot
+      : undefined,
   });
   picker = useAgentAddressLockPicker({
     mentions: mention,
@@ -219,6 +224,9 @@ async function setup(overrides = {}) {
   effects = [];
   state = {
     locked: [],
+    searchCalls: 0,
+    searchUsers: [],
+    nextCursor: null,
     channelId: CHANNEL,
     role: "bot",
     owner: VIEWER,
@@ -503,6 +511,125 @@ test("latest locked state permits removal after denial, including a retained tog
   assert.deepEqual(mention.knownNames, []);
 });
 
+const keyboard = (key) => ({
+  key,
+  nativeEvent: {
+    key,
+    altKey: false,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    isComposing: false,
+  },
+  preventDefault() {},
+});
+for (const key of [" ", "Tab", "Enter"]) {
+  test(`fast ${JSON.stringify(key)} cannot bind before the current search discovers a collision`, async () => {
+    await setup({
+      owner: OTHER,
+      visible: true,
+      directoryVisible: true,
+      searchUsers: [
+        { pubkey: OTHER, display_name: "Remote Scout", is_agent: false },
+      ],
+    });
+    let outcome;
+    await act(async () => {
+      mention.updateMentionQuery("@Remote Scout", 13);
+      outcome = mention.handleMentionKeyDown(keyboard(key));
+      assert.equal(
+        state.searchCalls,
+        0,
+        "no current-query search at decision time",
+      );
+    });
+    assert.equal(outcome.suggestion, undefined);
+    assert.deepEqual(mention.knownNames, []);
+    await settle();
+    assert.equal(
+      mention.suggestions.filter((row) => row.displayName === "Remote Scout")
+        .length,
+      2,
+    );
+    assert.ok(mention.suggestions.every((row) => row.hasNameCollision));
+    await act(async () => {
+      outcome = mention.handleMentionKeyDown(keyboard("Tab"));
+    });
+    assert.equal(outcome.suggestion, undefined);
+    // A deliberate keyboard choice remains usable once the query has settled.
+    await act(async () => mention.handleMentionKeyDown(keyboard("ArrowDown")));
+    await act(async () => {
+      outcome = mention.handleMentionKeyDown(keyboard("Enter"));
+    });
+    assert.ok(outcome.suggestion?.pubkey);
+  });
+}
+
+for (const condition of ["failed", "paging", "fetching", "complete"]) {
+  test(`current ${condition} search gates implicit completion but not an explicit row choice`, async () => {
+    await setup({
+      owner: OTHER,
+      visible: true,
+      directoryVisible: true,
+      failSearch: condition === "failed",
+      nextCursor: condition === "paging" ? "more" : null,
+    });
+    await act(async () => mention.updateMentionQuery("@Remote Scout", 13));
+    await settle();
+    let release;
+    if (condition === "fetching") {
+      await act(async () => {
+        void client.fetchQuery({
+          queryKey: ["user-search", "infinite", "remote scout", 50],
+          queryFn: () =>
+            new Promise((resolve) => {
+              release = resolve;
+            }),
+        });
+      });
+    }
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    let outcome;
+    await act(async () => {
+      outcome = mention.handleMentionKeyDown(keyboard("Tab"));
+    });
+    assert.equal(Boolean(outcome.suggestion), condition === "complete");
+    if (condition !== "complete") {
+      await act(async () => {
+        outcome = mention.handleMentionKeyDown(keyboard(" "));
+      });
+      assert.equal(outcome.suggestion, undefined);
+      await act(async () =>
+        mention.handleMentionKeyDown(keyboard("ArrowDown")),
+      );
+      await act(async () => {
+        outcome = mention.handleMentionKeyDown(keyboard("Enter"));
+      });
+      assert.ok(
+        outcome.suggestion?.pubkey,
+        "deliberate keyboard choice bypasses completeness, not admission",
+      );
+    }
+    const row = rows()[0];
+    assert.equal(mention.canSelectMention(row), true);
+    await act(async () => picker.selectMentionSuggestion(row));
+    assert.ok(
+      effects.some(
+        ([effect, edit]) =>
+          effect === "edit" && edit.insertText.includes("@Remote Scout"),
+      ),
+    );
+    if (release)
+      await act(async () =>
+        release({
+          pages: [{ users: [], nextCursor: null }],
+          pageParams: [null],
+        }),
+      );
+  });
+}
 test("retained team cannot bind a removed exact member", async () => {
   await setup({ visible: true, directoryVisible: true });
   const persona = {
@@ -560,6 +687,96 @@ test("retained team cannot bind a removed exact member", async () => {
   );
 });
 
+for (const key of ["Tab", "Enter"]) {
+  for (const phase of ["pending", "settled", "removed", "changed"]) {
+    test(`${phase} debounce preserves or declines deliberate exact ${key} choice`, async () => {
+      await setup({
+        visible: true,
+        directoryVisible: true,
+        searchUsers: [
+          { pubkey: OTHER, display_name: "Remote Person", is_agent: false },
+        ],
+      });
+      await act(async () => mention.updateMentionQuery("@Remote", 7));
+      await settle();
+      await act(async () => {
+        mention.updateMentionQuery("@RemoteX", 8);
+        mention.updateMentionQuery("@Remote", 7);
+      });
+      await act(async () =>
+        mention.handleMentionKeyDown(keyboard("ArrowDown")),
+      );
+      assert.equal(
+        mention.suggestions[mention.mentionSelectedIndex].pubkey,
+        OTHER,
+      );
+      if (phase === "settled") await settle();
+      if (phase === "removed") {
+        state.searchUsers = [];
+        await act(async () =>
+          client.invalidateQueries({ queryKey: ["user-search"] }),
+        );
+        await settle();
+        assert.equal(
+          mention.suggestions.some((row) => row.pubkey === OTHER),
+          false,
+        );
+      }
+      if (phase === "changed")
+        await act(async () => mention.updateMentionQuery("@Remote Scout", 13));
+      let outcome, edit;
+      await act(async () => {
+        outcome = mention.handleMentionKeyDown(keyboard(key));
+      });
+      if (phase === "removed" || phase === "changed") {
+        assert.equal(outcome.suggestion, undefined);
+        assert.deepEqual(mention.knownNames, []);
+        return;
+      }
+      assert.equal(outcome.suggestion?.pubkey, OTHER);
+      await act(async () => {
+        edit = mention.insertMention(outcome.suggestion, 7);
+      });
+      assert.equal(
+        mention.getDraftMentionRefs(edit.insertText)[0].pubkey,
+        OTHER,
+      );
+    });
+  }
+}
+for (const key of ["Tab", "Enter", " "]) {
+  test(`removed prefix cannot commit previous row with ${key}`, async () => {
+    await setup({ visible: true, directoryVisible: true });
+    await act(async () => mention.updateMentionQuery("@Remote Scout", 13));
+    await settle();
+    const row = rows()[0],
+      oldInsert = mention.insertMention;
+    let outcome, edit;
+    await act(async () => {
+      mention.updateMentionQuery("plain text", 10);
+      outcome = mention.handleMentionKeyDown(keyboard(key));
+    });
+    assert.equal(outcome.suggestion, undefined);
+    assert.equal(outcome.handled, false);
+    await act(async () => {
+      edit = oldInsert(row, 10);
+      picker.selectMentionSuggestion(row);
+    });
+    assert.equal(edit.insertText, "");
+    assert.deepEqual(effects, []);
+    assert.deepEqual(mention.knownNames, []);
+    await act(async () => mention.openMentionPicker(10));
+    await act(async () => {
+      edit = mention.insertMention(rows()[0], 10);
+    });
+    assert.equal(
+      edit.replaceFromOffset,
+      10,
+      "explicit picker still works without @",
+    );
+    assert.equal(mention.getDraftMentionRefs(edit.insertText)[0].pubkey, AGENT);
+  });
+}
 test("duplicate team members cannot mask a recipient set change", async () => {
   await setup({ visible: true, directoryVisible: true });
   const personas = ["one", "two"].map((id) => ({
@@ -613,4 +830,211 @@ test("duplicate team members cannot mask a recipient set change", async () => {
   assert.equal(edit.insertText, "");
   assert.deepEqual(mention.knownNames, []);
   assert.deepEqual(mention.getDraftMentionRefs(edit.insertText), []);
+});
+
+test("inverted stale prefix range is rejected before registering intent", async () => {
+  await setup({ visible: true, directoryVisible: true });
+  await act(async () => mention.updateMentionQuery("hello @Remote Scout", 19));
+  await settle();
+  const row = rows()[0];
+  let edit;
+  await act(async () => {
+    edit = mention.insertMention(row, 0);
+  });
+  assert.equal(edit.insertText, "");
+  assert.deepEqual(mention.knownNames, []);
+  assert.deepEqual(mention.getDraftMentionRefs("@Remote Scout"), []);
+});
+
+for (const mode of ["Tab", "Enter", "pointer"]) {
+  test(`live editor snapshot rejects caret-only departure on ${mode}`, async () => {
+    await setup({
+      visible: true,
+      directoryVisible: true,
+      editorSnapshot: { text: "hello @Remote Scout", cursor: 19 },
+    });
+    await act(async () =>
+      mention.updateMentionQuery(state.editorSnapshot.text, 19),
+    );
+    await settle();
+    const row = rows()[0];
+    const insert = mention.insertMention;
+    const keyDown = mention.handleMentionKeyDown;
+    // No document update: the editor snapshot, not the debounce refs, owns the caret.
+    state.editorSnapshot = { text: "hello @Remote Scout", cursor: 0 };
+    await act(async () => {
+      if (mode === "pointer") assert.equal(insert(row, 0).insertText, "");
+      else
+        assert.equal(
+          keyDown({
+            key: mode,
+            nativeEvent: { key: mode },
+            preventDefault() {},
+          }).suggestion,
+          undefined,
+        );
+    });
+    assert.deepEqual(mention.knownNames, []);
+    assert.deepEqual(mention.getDraftMentionRefs("@Remote Scout"), []);
+  });
+}
+
+for (const [name, original, live] of [
+  [
+    "different query",
+    "@Alice hello @Remote Scout",
+    { text: "@Alice hello @Remote Scout", cursor: 6 },
+  ],
+  [
+    "same query, different anchor",
+    "@Remote Scout hello @Remote Scout",
+    { text: "@Remote Scout hello @Remote Scout", cursor: 13 },
+  ],
+  [
+    "changed document",
+    "hello @Remote Scout",
+    { text: "other @Remote Scout", cursor: 19 },
+  ],
+]) {
+  for (const mode of ["Tab", "Enter", " ", "pointer", "pin"]) {
+    test(`${mode} rejects ${name} before binding or pinning stale intent`, async () => {
+      await setup({
+        visible: true,
+        directoryVisible: true,
+        editorSnapshot: { text: original, cursor: original.length },
+      });
+      await act(async () =>
+        mention.updateMentionQuery(original, original.length),
+      );
+      await settle();
+      const row = rows()[0];
+      const insert = mention.insertMention;
+      state.editorSnapshot = live;
+      await act(async () => {
+        if (mode === "pointer")
+          assert.equal(insert(row, live.cursor).insertText, "");
+        else if (mode === "pin") picker.toggleAlwaysAddressAgent(row);
+        else
+          assert.equal(
+            mention.handleMentionKeyDown(keyboard(mode)).suggestion,
+            undefined,
+          );
+      });
+      assert.deepEqual(mention.knownNames, []);
+      assert.deepEqual(effects, []);
+      // Refreshing the UI does not re-authorize the retained row, even if its key survives.
+      await settle();
+      await act(async () =>
+        assert.equal(insert(row, live.cursor).insertText, ""),
+      );
+    });
+  }
+}
+test("explicit no-trigger menu uses the current endpoint but not a retained inline row", async () => {
+  await setup({
+    visible: true,
+    directoryVisible: true,
+    editorSnapshot: { text: "plain words", cursor: 11 },
+  });
+  await act(async () => mention.openMentionPicker(11));
+  const row = rows()[0];
+  state.editorSnapshot.cursor = 0;
+  let edit;
+  await act(async () => {
+    edit = mention.insertMention(row, 0);
+  });
+  assert.deepEqual(edit, {
+    replaceFromOffset: 0,
+    replaceToOffset: 0,
+    insertText: "@Remote Scout ",
+  });
+  assert.equal(mention.getDraftMentionRefs(edit.insertText)[0].pubkey, AGENT);
+});
+
+test("pending debounce cannot retarget a caret-only move to another live prefix", async () => {
+  const text = "@Remote Scout hello @Remote Scout";
+  await setup({
+    visible: true,
+    directoryVisible: true,
+    editorSnapshot: { text, cursor: text.length },
+  });
+  await act(async () => mention.updateMentionQuery(text, text.length));
+  await settle();
+  await act(async () => mention.updateMentionQuery(text, text.length));
+  state.editorSnapshot.cursor = 13;
+  await act(async () => {
+    assert.equal(
+      mention.handleMentionKeyDown(keyboard("Tab")).suggestion,
+      undefined,
+    );
+  });
+  assert.deepEqual(mention.knownNames, []);
+});
+
+test("keyboard result remains bound until insertion and cannot cross a channel visit", async () => {
+  const text = "hello @Remote Scout";
+  await setup({
+    visible: true,
+    directoryVisible: true,
+    editorSnapshot: { text, cursor: text.length },
+  });
+  await act(async () => mention.updateMentionQuery(text, text.length));
+  await settle();
+  let choice;
+  const oldKeyDown = mention.handleMentionKeyDown;
+  await act(async () => {
+    choice = oldKeyDown(keyboard("Tab")).suggestion;
+  });
+  assert.equal(choice.pubkey, AGENT);
+  state.editorSnapshot = { text: "other @Remote Scout", cursor: text.length };
+  await act(async () =>
+    assert.equal(mention.insertMention(choice, text.length).insertText, ""),
+  );
+  state.channelId = "another-channel";
+  await render();
+  state.channelId = CHANNEL;
+  await render();
+  await act(async () => mention.updateMentionQuery(text, text.length));
+  state.editorSnapshot = { text, cursor: text.length };
+  await settle();
+  await act(async () => {
+    assert.equal(oldKeyDown(keyboard("Tab")).suggestion, undefined);
+    assert.equal(mention.insertMention(choice, text.length).insertText, "");
+  });
+  assert.deepEqual(mention.knownNames, []);
+});
+
+test("default shortcut intent admits a current agent without opening an inline picker", async () => {
+  await setup({
+    visible: true,
+    directoryVisible: true,
+    editorSnapshot: { text: "plain", cursor: 5 },
+  });
+  await act(async () => mention.cancelMentionAutocomplete());
+  await act(async () =>
+    picker.toggleAlwaysAddressAgent(mention.getDefaultAgentSuggestion()),
+  );
+  assert.ok(effects.some(([kind, key]) => kind === "promote" && key === AGENT));
+  assert.equal(mention.isMentionOpen, false);
+});
+
+test("editing plain text refreshes an explicit menu before its next choice", async () => {
+  await setup({
+    visible: true,
+    directoryVisible: true,
+    editorSnapshot: { text: "draft text", cursor: 10 },
+  });
+  await act(async () => mention.openMentionPicker(10));
+  const oldRow = rows()[0];
+  state.editorSnapshot = { text: "", cursor: 0 };
+  await act(async () => mention.updateMentionQuery("", 0));
+  assert.equal(mention.isMentionOpen, true);
+  const freshRow = rows()[0];
+  assert.notEqual(freshRow, oldRow);
+  await act(async () => {
+    assert.equal(
+      mention.insertMention(freshRow, 0).insertText,
+      "@Remote Scout ",
+    );
+  });
 });

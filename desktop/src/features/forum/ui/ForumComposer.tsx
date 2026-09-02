@@ -74,7 +74,11 @@ export function ForumComposer({
     if (compact) setIsCompactExpanded(true);
   }, [compact]);
 
-  const mentions = useMentions(channelId, members, profiles, { channelType });
+  const mentions = useMentions(channelId, members, profiles, {
+    channelType,
+    getEditorSnapshot: (): { text: string; cursor: number } =>
+      richText.getPlainTextAndCursor(),
+  });
   const channelLinks = useChannelLinks();
   const media = useMediaUpload();
   const { handlePaperclipClick, handleToolbarMouseDown, shouldIgnoreBlur } =

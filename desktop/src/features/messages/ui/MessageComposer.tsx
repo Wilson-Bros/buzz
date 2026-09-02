@@ -152,6 +152,8 @@ function MessageComposerImpl({
   const mentions = useMentions(channelId, undefined, profiles, {
     channelType,
     recentMentionPubkeys,
+    getEditorSnapshot: (): { text: string; cursor: number } =>
+      richText.getPlainTextAndCursor(),
   });
   const channelLinks = useChannelLinks();
   const customEmoji = useCustomEmoji();

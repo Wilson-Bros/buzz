@@ -60,6 +60,35 @@ function autocomplete(page: import("@playwright/test").Page) {
     .getByTestId("mention-autocomplete");
 }
 
+async function waitForCompleteMentionSearch(
+  page: import("@playwright/test").Page,
+  query: string,
+) {
+  await expect
+    .poll(() =>
+      page.evaluate((query) => {
+        const state = window.__BUZZ_E2E_QUERY_CLIENT__?.getQueryState([
+          "user-search",
+          "infinite",
+          query,
+          50,
+        ]) as
+          | {
+              status: string;
+              fetchStatus: string;
+              data?: { pages: { nextCursor: string | null }[] };
+            }
+          | undefined;
+        return (
+          state?.status === "success" &&
+          state.fetchStatus === "idle" &&
+          state.data?.pages.at(-1)?.nextCursor === null
+        );
+      }, query),
+    )
+    .toBe(true);
+}
+
 async function readCommandLog(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
     return (
@@ -549,7 +578,7 @@ test("relay-only shared agents emit an outbound mention tag when selected", asyn
 
   await expect
     .poll(() => readOutgoingMentionPubkeys(page, content))
-    .toContain(TEST_IDENTITIES.alice.pubkey);
+    .toEqual([TEST_IDENTITIES.alice.pubkey]);
 });
 
 test("typing an exact agent name and Space commits its chip and mention tag", async ({
@@ -580,7 +609,7 @@ test("typing an exact agent name and Space commits its chip and mention tag", as
   await page.getByTestId("send-message").click();
   await expect
     .poll(() => readOutgoingMentionPubkeys(page, content))
-    .toContain(TEST_IDENTITIES.alice.pubkey);
+    .toEqual([TEST_IDENTITIES.alice.pubkey]);
 });
 
 test("Shift+Space leaves an exact agent name plain and emits no mention tag", async ({
@@ -642,6 +671,7 @@ test("Space inside a code block leaves an exact agent name literal", async ({
   await expect(input.locator("pre")).toBeVisible();
 
   await page.keyboard.type("deploy @ALICE");
+  await waitForCompleteMentionSearch(page, "alice");
   await page.keyboard.press(" ");
   await page.keyboard.type("now");
 
@@ -666,6 +696,7 @@ test("Space inside an inline code span leaves an exact agent name literal", asyn
   // backticks from the text the mention pipeline reads.
   await page.keyboard.type("run `@ALICE`");
   await expect(input.locator("code")).toHaveText("@ALICE");
+  await waitForCompleteMentionSearch(page, "alice");
 
   await page.keyboard.press(" ");
   await page.keyboard.type("now");
@@ -679,27 +710,49 @@ test("Space inside an inline code span leaves an exact agent name literal", asyn
     .toEqual([]);
 });
 
-test("Space still resolves an exact agent name typed after a code span", async ({
-  page,
-}) => {
-  await page.goto("/");
-  await page.getByTestId("channel-general").click();
-  await expect(page.getByTestId("chat-title")).toHaveText("general");
+for (const separator of [" ", "\u00a0"]) {
+  test(`Space still resolves an exact agent name typed after a code span (${separator === " " ? "space" : "NBSP"})`, async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("channel-general").click();
+    await expect(page.getByTestId("chat-title")).toHaveText("general");
 
-  const input = page.getByTestId("message-input");
-  await input.click();
-  await page.keyboard.type("run `deploy` @ALICE");
-  await page.keyboard.press(" ");
-  await page.keyboard.type("now");
+    const input = page.getByTestId("message-input");
+    await input.click();
+    await page.keyboard.type(`run \`deploy\`${separator}@ALICE`);
+    await waitForCompleteMentionSearch(page, "alice");
+    await expect(input.locator("code")).toHaveText("deploy");
+    await page.keyboard.press(" ");
+    await page.keyboard.type("now");
 
-  const content = "run `deploy` @alice now";
-  await expect(input).toHaveText("run deploy @alice now");
+    await expect(input).toHaveText("run deploy @alice now");
 
-  await page.getByTestId("send-message").click();
-  await expect
-    .poll(() => readOutgoingMentionPubkeys(page, content))
-    .toContain(TEST_IDENTITIES.alice.pubkey);
-});
+    await page.getByTestId("send-message").click();
+    // Chromium may author NBSP after the code mark. Require the full signed
+    // body (including its code mark and single separator), not an ASCII-only
+    // lookup that reports null even when the exact recipient was published.
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          window.__BUZZ_E2E_SIGNED_EVENTS__
+            ?.filter((event) => event.kind === 9)
+            .map((event) => ({
+              content: event.content,
+              recipients: event.tags
+                .filter((tag) => tag[0] === "p")
+                .map((tag) => tag[1]),
+            })),
+        ),
+      )
+      .toEqual([
+        {
+          content: expect.stringMatching(/^run `deploy`[ \u00a0]@alice now$/),
+          recipients: [TEST_IDENTITIES.alice.pubkey],
+        },
+      ]);
+  });
+}
 
 test("thread autocomplete keeps multiple long names readable in a narrow panel", async ({
   page,
@@ -3015,7 +3068,7 @@ test("global non-member people can be selected from channel mentions", async ({
   await expect(dropdown.getByText("not in channel")).toBeVisible();
 });
 
-test("duplicate global people with the same visible identity collapse in channel mentions", async ({
+test("distinct same-name global people remain independently selectable", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -3039,7 +3092,27 @@ test("duplicate global people with the same visible identity collapse in channel
   await input.fill("@pip");
 
   const dropdown = autocomplete(page);
-  await expect(dropdown.locator("button", { hasText: "Pip" })).toHaveCount(1);
+  const keys = [CASEY_PROFILE_PUBKEY, "2".repeat(64)];
+  await waitForCompleteMentionSearch(page, "pip");
+  await input.press("Tab");
+  await expect(input).toHaveText("@pip");
+  for (const key of keys) {
+    await input.fill("@pip");
+    const row = dropdown.getByTestId(`mention-suggestion-${key}`);
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText("Pip");
+    await expect(row.locator("[title^=npub]")).toHaveCount(1);
+    await row.locator("button").first().click();
+    await page.keyboard.type(key.slice(0, 1));
+    const content = `@Pip ${key.slice(0, 1)}`;
+    await page.getByTestId("send-message").click();
+    await expect(page.getByRole("alertdialog")).toBeVisible();
+    expect(await readOutgoingMentionPubkeys(page, content)).toBeNull();
+    await page.getByRole("button", { name: "Invite", exact: true }).click();
+    await expect
+      .poll(() => readOutgoingMentionPubkeys(page, content))
+      .toEqual([key]);
+  }
 });
 
 test("sent non-member person mention uses the normal mention style", async ({
@@ -3694,3 +3767,73 @@ test("delayed inaccessible agent profile keeps all actions hidden", async ({
     ),
   ).toHaveCount(0);
 });
+
+for (const channel of ["general", "watercooler"]) {
+  for (const [original, cursor] of [
+    ["hello @Scout", 0],
+    ["@Alice hello @Scout", 6],
+    ["@Scout hello @Scout", 6],
+  ] as const) {
+    for (const mode of ["Tab", "pointer"]) {
+      test(`caret-only departure to ${cursor} in ${original} preserves ${channel} draft on ${mode}`, async ({
+        page,
+      }) => {
+        const pubkey = "11".repeat(32);
+        await installMockBridge(page, {
+          managedAgents: [],
+          relayAgents: [
+            {
+              pubkey,
+              name: "Scout",
+              ownerPubkey: "deadbeef".repeat(8),
+              respondTo: "anyone",
+              channelNames: [channel],
+            },
+          ],
+          searchProfiles: [{ pubkey, displayName: "Scout", isAgent: true }],
+        });
+        await page.goto("/");
+        await page.getByTestId(`channel-${channel}`).click();
+        if (channel === "watercooler")
+          await page
+            .getByRole("button", { name: "Start a new post..." })
+            .click();
+        const input = page.getByTestId("message-input");
+        await input.fill(original);
+        const row = page.getByTestId(`mention-suggestion-${pubkey}`);
+        await expect(row).toBeVisible();
+        await expect
+          .poll(() =>
+            page.evaluate(
+              () =>
+                window.__BUZZ_E2E_QUERY_CLIENT__?.getQueryState([
+                  "user-search",
+                  "infinite",
+                  "scout",
+                  50,
+                ])?.status,
+            ),
+          )
+          .toBe("success");
+        for (let i = 0; i < original.length - cursor; i++)
+          await input.press("ArrowLeft");
+        await expect
+          .poll(() =>
+            input.evaluate((el) => {
+              const selection = window.getSelection();
+              if (!selection?.anchorNode) return -1;
+              const range = document.createRange();
+              range.selectNodeContents(el);
+              range.setEnd(selection.anchorNode, selection.anchorOffset);
+              return range.toString().length;
+            }),
+          )
+          .toBe(cursor);
+        // Try the still-rendered pointer row before debounce, or accept its closure.
+        if (mode === "Tab") await input.press("Tab");
+        else if (await row.isVisible()) await row.click();
+        await expect(input).toHaveText(original);
+      });
+    }
+  }
+}
