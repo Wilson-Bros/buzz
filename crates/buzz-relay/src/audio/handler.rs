@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use buzz_auth::generate_challenge;
+use buzz_auth::{generate_challenge, VerifiedAssertion};
 use buzz_core::tenant::TenantContext;
 use buzz_db::channel::MemberRole;
 
@@ -87,6 +87,20 @@ pub async fn ws_audio_handler(
         }
     };
 
+    // NIP-FI assertion check at upgrade — every authenticated WebSocket ingress
+    // (including huddle audio) must pass through the same pre-101 gate.
+    // [FI-TRACE-TRANSPORT-CLOSED] [NIP-FI.md §Admission pairing sequence]
+    let nip_fi_assertion = {
+        use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
+        let mode = state.config.nip_fi.mode;
+        let verifier = state.nip_fi_verifier.as_deref();
+        match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+            NipFiUpgradeOutcome::NotRequired => None,
+            NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
+            NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
+        }
+    };
+
     let permit = match acquire_audio_connection_permit(&state.conn_semaphore) {
         Some(permit) => permit,
         None => {
@@ -103,7 +117,7 @@ pub async fn ws_audio_handler(
     // checks in the receive loop still distinguish text from binary policy, but
     // they run after tungstenite has assembled a message.
     limit_audio_websocket(ws).on_upgrade(move |socket| {
-        handle_audio_connection(socket, state, tenant, channel_id, permit)
+        handle_audio_connection(socket, state, tenant, channel_id, permit, nip_fi_assertion)
     })
 }
 
@@ -147,6 +161,7 @@ async fn handle_audio_connection(
     tenant: TenantContext,
     channel_id: Uuid,
     _permit: OwnedSemaphorePermit,
+    nip_fi_assertion: Option<VerifiedAssertion>,
 ) {
     let cancel = CancellationToken::new();
     let control = CommunityConnectionControl::new(cancel);
@@ -161,7 +176,14 @@ async fn handle_audio_connection(
         control,
         move || async move { check_state.db.is_community_active(community_id).await },
         move |control| {
-            handle_active_audio_connection(socket, run_state, tenant, channel_id, control)
+            handle_active_audio_connection(
+                socket,
+                run_state,
+                tenant,
+                channel_id,
+                control,
+                nip_fi_assertion,
+            )
         },
     )
     .await;
@@ -173,6 +195,7 @@ async fn handle_active_audio_connection(
     tenant: TenantContext,
     channel_id: Uuid,
     control: CommunityConnectionControl,
+    nip_fi_assertion: Option<VerifiedAssertion>,
 ) {
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
@@ -246,6 +269,69 @@ async fn handle_active_audio_connection(
     let pubkey_hex = pubkey.to_hex();
     let pubkey_bytes = pubkey.to_bytes().to_vec();
     let parent_channel_id = auth_msg.parent_channel_id;
+
+    // NIP-FI key pairing [FI-INV-05]: unconditional — identical to the main
+    // relay auth handler. When an assertion was presented at upgrade, the
+    // proven NIP-42 key MUST equal the assertion's `nostr_pubkey` claim.
+    // A None asserted_key (claimless assertion) is also a denial — defense in
+    // depth against assertions that omit the required claim.
+    // [FI-TRACE-DENIAL-ORACLE post-establishment]
+    if let Some(ref assertion) = nip_fi_assertion {
+        match assertion.asserted_key() {
+            Some(asserted_key) if asserted_key == pubkey => {
+                // Keys match — proceed.
+            }
+            Some(asserted_key) => {
+                warn!(
+                    channel_id = %channel_id,
+                    proven_pubkey = %pubkey.to_hex(),
+                    asserted_pubkey = %asserted_key.to_hex(),
+                    "NIP-FI audio key pairing mismatch — closing connection"
+                );
+                use buzz_auth::DenialClass;
+                let _ = ws_send
+                    .send(WsMessage::Text(
+                        serde_json::json!({
+                            "type": "restricted",
+                            "message": DenialClass::AuthorizationDenied.nostr_text()
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                return;
+            }
+            None => {
+                // Claimless assertion — no nostr_pubkey in token. Deny per spec.
+                warn!(
+                    channel_id = %channel_id,
+                    pubkey = %pubkey.to_hex(),
+                    "NIP-FI audio assertion has no nostr_pubkey claim — closing connection"
+                );
+                use buzz_auth::DenialClass;
+                let _ = ws_send
+                    .send(WsMessage::Text(
+                        serde_json::json!({
+                            "type": "restricted",
+                            "message": DenialClass::AuthorizationDenied.nostr_text()
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                return;
+            }
+        }
+    }
+
+    // Compute the NIP-FI session deadline (same three-term formula as main relay).
+    // [FI-TRACE-LEASE-BOUND]
+    let audio_session_deadline = nip_fi_assertion.as_ref().map(|a| {
+        crate::connection::compute_session_deadline(
+            a,
+            state.config.nip_fi.max_connection_lifetime(),
+        )
+    });
 
     if crate::api::relay_members::enforce_relay_membership(
         &state,
@@ -743,6 +829,40 @@ async fn handle_active_audio_connection(
         cancel.clone(),
     ));
 
+    // NIP-FI session-lifetime enforcement task — mirrors connection.rs.
+    // Fires at `audio_session_deadline`, sends the exact restricted: text on
+    // ctrl_tx (priority, ahead of Close), then cancels. No in-band renewal.
+    // [FI-TRACE-LEASE-BOUND]
+    let nip_fi_audio_expiry_task = audio_session_deadline.map(|deadline| {
+        let expiry_cancel = cancel.clone();
+        let expiry_ctrl_tx = ctrl_tx.clone();
+        tokio::spawn(async move {
+            let now = chrono::Utc::now();
+            let remaining = if now < deadline {
+                (deadline - now)
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO)
+            } else {
+                std::time::Duration::ZERO
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => {
+                    use buzz_auth::DenialClass;
+                    let msg = DenialClass::AuthorizationDenied.nostr_text();
+                    let _ = expiry_ctrl_tx.try_send(WsMessage::Text(
+                        serde_json::json!({"type":"restricted","message": msg})
+                            .to_string()
+                            .into(),
+                    ));
+                    metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
+                    warn!("NIP-FI audio session lease expired — closing connection");
+                    expiry_cancel.cancel();
+                }
+                _ = expiry_cancel.cancelled() => {}
+            }
+        })
+    });
+
     // Non-owner path: own the owner's `HuddleControl` stream in a reader task.
     // It races the owner's teardown signal against our own cancellation:
     //   * owner speaks first (`Goodbye` / stream close) → tear the client down
@@ -863,7 +983,9 @@ async fn handle_active_audio_connection(
     if let Some(owner_teardown_task) = owner_teardown_task {
         let _ = owner_teardown_task.await;
     }
-
+    if let Some(expiry_task) = nip_fi_audio_expiry_task {
+        let _ = expiry_task.await;
+    }
     // Atomic owner remove + end check: remove_peer_and_check_ended holds the
     // AdmissionGuard lock across index recycling AND the is_empty + ended=true
     // check. Ingress mirrors never archive authoritative huddle state; they

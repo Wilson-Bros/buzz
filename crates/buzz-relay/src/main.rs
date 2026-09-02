@@ -472,11 +472,16 @@ async fn main() -> anyhow::Result<()> {
     // startup must NOT abort the process — relay availability cannot be
     // hostage to IdP availability. The relay starts and denies admissions
     // with `authorization_unavailable` (503) until a snapshot lands. The
-    // background refresh loop owns recovery, retrying on every tick.
+    // background refresh loop owns recovery.
     //
     // The state holds `nip_fi_jwks_source` (shared via `Arc`) alongside
     // `nip_fi_verifier` (which holds a clone of the same `Arc`). Warming the
     // source delivers snapshots to the verifier at every upgrade check.
+    //
+    // The refresh task is owned: a `CancellationToken` + `JoinHandle` let
+    // the process cancel it cleanly on shutdown instead of leaking the task.
+    let jwks_refresh_cancel = CancellationToken::new();
+    let jwks_refresh_handle: Option<tokio::task::JoinHandle<()>>;
     if let Some(jwks_source) = state.nip_fi_jwks_source.clone() {
         let jwks_configs = state.config.nip_fi.jwks_configs.clone();
         info!(
@@ -484,10 +489,9 @@ async fn main() -> anyhow::Result<()> {
             "NIP-FI: warming JWKS snapshots"
         );
 
-        // Startup warm: call `get_snapshot` for each issuer. At startup the
-        // internal cache is empty, so this triggers a fetch and stores the
-        // result. Returns `None` on failure — we log a warn and continue; the
-        // relay starts and denies with 503 until a subsequent fetch succeeds.
+        // Startup warm: call `get_snapshot` for each issuer. Returns `None`
+        // on failure — log a warn and continue; the relay starts, denies
+        // with 503, and the background loop owns recovery via bounded backoff.
         for cfg in &jwks_configs {
             match jwks_source.get_snapshot(&cfg.issuer).await {
                 Some(_) => {
@@ -503,42 +507,66 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Background refresh loop: re-invoke `get_snapshot` on every tick.
-        // `get_snapshot` refreshes inline when the cached snapshot is stale
-        // (age ≥ contract.refresh_interval_seconds) and is a no-op otherwise,
-        // so calling it periodically at the minimum configured refresh interval
-        // is correct and safe.
+        // Background refresh loop: owned, cancellable, with bounded exponential
+        // backoff for cold-start failures and normal cadence after first success.
+        // A panic inside the task kills only the task; the relay continues to
+        // deny with 503 rather than crashing. The process cancels the token on
+        // shutdown, which terminates the loop cleanly.
         let refresh_source = Arc::clone(&jwks_source);
-        tokio::spawn(async move {
-            let base_interval_secs = jwks_configs
-                .iter()
-                .map(|c| c.contract.refresh_interval_seconds())
-                .min()
-                .unwrap_or(300);
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(base_interval_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let refresh_cancel = jwks_refresh_cancel.clone();
+        let base_interval_secs = jwks_configs
+            .iter()
+            .map(|c| c.contract.refresh_interval_seconds())
+            .min()
+            .unwrap_or(300);
+        jwks_refresh_handle = Some(tokio::spawn(async move {
+            // Bounded exponential backoff for cold-start: 5s → 10s → 20s → … → base_interval.
+            let mut backoff_secs: u64 = 5;
+            let mut any_success = false;
 
             loop {
-                interval.tick().await;
+                let sleep_secs = if any_success {
+                    // Normal cadence once at least one snapshot is live.
+                    base_interval_secs
+                } else {
+                    backoff_secs
+                };
+
+                tokio::select! {
+                    biased;
+                    _ = refresh_cancel.cancelled() => {
+                        tracing::debug!("NIP-FI: JWKS refresh loop cancelled");
+                        return;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
+                }
+
+                let mut tick_success = false;
                 for cfg in &jwks_configs {
                     match refresh_source.get_snapshot(&cfg.issuer).await {
                         Some(_) => {
-                            tracing::debug!(
-                                issuer = %cfg.issuer,
-                                "NIP-FI: JWKS snapshot refreshed"
-                            );
+                            tracing::debug!(issuer = %cfg.issuer, "NIP-FI: JWKS snapshot refreshed");
+                            tick_success = true;
                         }
                         None => {
                             tracing::warn!(
                                 issuer = %cfg.issuer,
-                                "NIP-FI: JWKS refresh failed — will retry on next tick"
+                                "NIP-FI: JWKS refresh failed — will retry"
                             );
                         }
                     }
                 }
+
+                if tick_success {
+                    any_success = true;
+                } else if !any_success {
+                    // Still in cold-start backoff: double with a 300s ceiling.
+                    backoff_secs = (backoff_secs * 2).min(base_interval_secs.max(300));
+                }
             }
-        });
+        }));
+    } else {
+        jwks_refresh_handle = None;
     }
 
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
@@ -1223,7 +1251,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    serve(router, health_router, Arc::clone(&state)).await?;
+    serve(
+        router,
+        health_router,
+        Arc::clone(&state),
+        jwks_refresh_cancel,
+        jwks_refresh_handle,
+    )
+    .await?;
     state.community_revalidator_cancel.cancel();
 
     // Signal the audit worker to stop accepting, flush buffered entries, and
@@ -1374,6 +1409,8 @@ async fn serve(
     router: axum::Router,
     health_router: axum::Router,
     state: Arc<AppState>,
+    jwks_refresh_cancel: CancellationToken,
+    jwks_refresh_handle: Option<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let config = &state.config;
 
@@ -1502,6 +1539,11 @@ async fn serve(
             .map_err(|e| anyhow::anyhow!("Shutdown task failed: {e}"))?;
         uds_handle.abort();
         hard_shutdown.abort();
+        // Cancel and join the JWKS refresh task so it doesn't outlive the process.
+        jwks_refresh_cancel.cancel();
+        if let Some(h) = jwks_refresh_handle {
+            let _ = h.await;
+        }
         return Ok(());
     }
 
@@ -1526,6 +1568,11 @@ async fn serve(
         .await
         .map_err(|e| anyhow::anyhow!("Shutdown task failed: {e}"))?;
     hard_shutdown.abort();
+    // Cancel and join the JWKS refresh task so it doesn't outlive the process.
+    jwks_refresh_cancel.cancel();
+    if let Some(h) = jwks_refresh_handle {
+        let _ = h.await;
+    }
     Ok(())
 }
 

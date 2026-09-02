@@ -1560,12 +1560,11 @@ mod tests {
         crate::nip11::RelayInfo::build(
             None,
             None,
-            false,
+            crate::nip11::RelayCapabilityFlags::default(),
             crate::config::DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         )
         .limitation
         .expect("limitation")

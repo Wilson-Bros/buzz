@@ -11,8 +11,11 @@
 //! |---|---|---|
 //! | `BUZZ_NIP_FI_MODE` | No | `enforce` (default), `deny_protected`, or `off`. |
 //! | `BUZZ_NIP_FI_ISSUERS` | If enforce | JSON array of issuer configs (see [`IssuerEnvConfig`]). |
-//! | `BUZZ_NIP_FI_MAXIMUM_ASSERTION_AGE_SECS` | If enforce | Max age of `iat + max_age` residual. |
 //! | `BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS` | If enforce | Per-partition limit on session lifetime. |
+//!
+//! `maximum_assertion_age` is per-issuer only (field `maximum_assertion_age_seconds` in
+//! the issuer JSON array), not a relay-level env var. A relay-level duplicate that could
+//! disagree with the enforced per-issuer value was removed in this PR.
 //!
 //! Absent or empty `BUZZ_NIP_FI_MODE` defaults to `off`, keeping the relay
 //! backward-compatible until an operator explicitly enables enforcement.
@@ -27,8 +30,6 @@ use jsonwebtoken::Algorithm;
 
 use crate::config::ConfigError;
 
-/// Maximum accepted `maximum_assertion_age` in seconds (24 h, matching `buzz-auth`).
-const MAX_ASSERTION_AGE_SECS: u64 = 86_400;
 /// Maximum accepted `max_connection_lifetime` in seconds (30 days).
 const MAX_CONNECTION_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 
@@ -44,7 +45,6 @@ const MAX_CONNECTION_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 ///     "audiences": ["https://relay.example.com"],
 ///     "token_class": "nip-fi+jwt",
 ///     "algorithms": ["ES256"],
-///     "require_attested_key": false,
 ///     "skew_seconds": 30,
 ///     "maximum_assertion_age_seconds": 3600,
 ///     "jwks_uri": "https://login.example.com/.well-known/jwks.json",
@@ -53,6 +53,8 @@ const MAX_CONNECTION_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 ///   }
 /// ]
 /// ```
+/// Any `require_attested_key` field in the JSON is silently ignored by serde
+/// (no `deny_unknown_fields`). S3 forces it true for every issuer; S2 removes the knob.
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct IssuerEnvConfig {
     /// Exact `iss` value.
@@ -63,9 +65,6 @@ pub(super) struct IssuerEnvConfig {
     pub token_class: TokenClassEnvConfig,
     /// Algorithm names, e.g. `["ES256", "RS256"]`.
     pub algorithms: Vec<String>,
-    /// Whether `nostr_pubkey` must be present and equal the proven actor.
-    #[serde(default)]
-    pub require_attested_key: bool,
     /// Accepted clock skew in seconds (≤ 300).
     #[serde(default)]
     pub skew_seconds: u64,
@@ -95,7 +94,7 @@ pub(super) enum TokenClassEnvConfig {
 ///
 /// Carries the validated `NipFiMode`, the full `IssuerRegistry`,
 /// the parallel `IssuerJwksConfig` slice for `ProductionJwksSource`, and the
-/// two session-lifetime bounds.
+/// session-lifetime bound.
 #[derive(Debug, Clone)]
 pub struct NipFiRelayConfig {
     /// The enforcement mode selected by `BUZZ_NIP_FI_MODE`.
@@ -104,13 +103,10 @@ pub struct NipFiRelayConfig {
     pub registry: IssuerRegistry,
     /// Parallel JWKS configs for `ProductionJwksSource` construction.
     pub jwks_configs: Vec<IssuerJwksConfig>,
-    /// Maximum residual lifetime of one assertion (`iat + max_assertion_age`).
-    /// Deployment-configured; absent defaults to 1 h in `enforce` mode.
-    pub maximum_assertion_age_secs: u64,
     /// Hard upper bound on a single connection lease, in seconds.
-    /// The lease is `min(session_deadline, max_connection_lifetime)` per
-    /// the spec partition rule. Absent means no additional partition.
-    pub max_connection_lifetime_secs: Option<u64>,
+    /// Required in enforce mode per spec (NIP-FI.md §Request and session
+    /// bounds): every deployment MUST configure a positive finite value.
+    pub max_connection_lifetime_secs: u64,
 }
 
 impl NipFiRelayConfig {
@@ -126,8 +122,7 @@ impl NipFiRelayConfig {
                 mode,
                 registry: IssuerRegistry::new(),
                 jwks_configs: Vec::new(),
-                maximum_assertion_age_secs: 3_600,
-                max_connection_lifetime_secs: None,
+                max_connection_lifetime_secs: 0,
             });
         }
 
@@ -156,24 +151,25 @@ impl NipFiRelayConfig {
             ));
         }
 
-        let maximum_assertion_age_secs = parse_u64_bounded(
-            "BUZZ_NIP_FI_MAXIMUM_ASSERTION_AGE_SECS",
-            1,
-            MAX_ASSERTION_AGE_SECS,
-        )?
-        .ok_or_else(|| {
-            ConfigError::InvalidValue(
-                "BUZZ_NIP_FI_MODE=enforce but \
-                         BUZZ_NIP_FI_MAXIMUM_ASSERTION_AGE_SECS is not set"
-                    .to_string(),
-            )
-        })?;
+        // `BUZZ_NIP_FI_MAXIMUM_ASSERTION_AGE_SECS` is intentionally NOT parsed
+        // here. The authoritative `maximum_assertion_age` comes from each issuer's
+        // JSON config entry (field `maximum_assertion_age_seconds`). A relay-level
+        // duplicate that could disagree with the per-issuer value is a config-drift
+        // trap — removed in this PR.
 
         let max_connection_lifetime_secs = parse_u64_bounded(
             "BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS",
             1,
             MAX_CONNECTION_LIFETIME_SECS,
-        )?;
+        )?
+        .ok_or_else(|| {
+            ConfigError::InvalidValue(
+                "BUZZ_NIP_FI_MODE=enforce but \
+                         BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS is not set; \
+                         every enforce deployment must configure a positive finite value"
+                    .to_string(),
+            )
+        })?;
 
         let mut registry = IssuerRegistry::new();
         let mut jwks_configs = Vec::with_capacity(issuer_entries.len());
@@ -198,7 +194,6 @@ impl NipFiRelayConfig {
             mode,
             registry,
             jwks_configs,
-            maximum_assertion_age_secs,
             max_connection_lifetime_secs,
         })
     }
@@ -284,10 +279,9 @@ fn build_issuer(entry: &IssuerEnvConfig) -> Result<(IssuerPolicy, IssuerJwksConf
         entry.jwks_hard_deadline_seconds,
     )
     .ok_or_else(|| {
-        format!(
-            "invalid JWKS source contract (check jwks_uri is HTTPS, \
+        "invalid JWKS source contract (check jwks_uri is HTTPS, \
              refresh_interval < hard_deadline, and both are positive)"
-        )
+            .to_string()
     })?;
 
     let policy = IssuerPolicy::new(
@@ -296,13 +290,19 @@ fn build_issuer(entry: &IssuerEnvConfig) -> Result<(IssuerPolicy, IssuerJwksConf
         token_class,
         FreshnessClass::OfflineJwt,
         algorithms,
-        entry.require_attested_key,
+        // S3 structurally forces this true — the spec makes `nostr_pubkey` a
+        // REQUIRED claim and `FI-INV-05` mandates unconditional key pairing.
+        // The `require_attested_key` field in the issuer JSON config is ignored;
+        // S2 removes the knob entirely from buzz-auth. Hard-wiring true here
+        // ensures any assertion without `nostr_pubkey` is rejected by the
+        // verifier before it reaches the upgrade gate.
+        true, // require_attested_key — S3 enforces structurally; S2 removes the knob
         entry.skew_seconds,
         entry.maximum_assertion_age_seconds,
         None, // offline-jwt: no status age
         jwks_contract.clone(),
     )
-    .map_err(|e: IssuerPolicyError| format!("{e}"))?;
+    .map_err(|e: IssuerPolicyError| e.to_string())?;
 
     let jwks_config = IssuerJwksConfig {
         issuer: entry.issuer.clone(),
@@ -315,10 +315,14 @@ fn build_issuer(entry: &IssuerEnvConfig) -> Result<(IssuerPolicy, IssuerJwksConf
 // ── Duration helpers ──────────────────────────────────────────────────────────
 
 impl NipFiRelayConfig {
-    /// Returns the configured `max_connection_lifetime` as a `Duration`,
-    /// if set.
+    /// Returns the configured `max_connection_lifetime` as a `Duration`.
+    /// Returns `None` in `Off`/`DenyProtected` mode (sentinel value 0).
     pub fn max_connection_lifetime(&self) -> Option<Duration> {
-        self.max_connection_lifetime_secs.map(Duration::from_secs)
+        if self.max_connection_lifetime_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.max_connection_lifetime_secs))
+        }
     }
 
     /// Returns `true` when the relay is in `Enforce` mode.

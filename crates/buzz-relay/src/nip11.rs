@@ -151,6 +151,19 @@ fn relay_limitation(max_message_length: usize, advertise_fi: bool) -> RelayLimit
     }
 }
 
+/// Build-time capability flags for [`RelayInfo::build`].
+///
+/// Grouping the boolean capability flags gives `build` a named seam for
+/// protocol advertisement decisions and drops the argument count below the
+/// clippy threshold.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct RelayCapabilityFlags {
+    /// Whether NIP-43 (relay membership) is advertised in `supported_nips`.
+    pub advertise_nip43: bool,
+    /// Whether NIP-FI (federated identity) is advertised.
+    pub advertise_fi: bool,
+}
+
 impl RelayInfo {
     /// Builds the relay's NIP-11 information document.
     ///
@@ -179,16 +192,19 @@ impl RelayInfo {
     /// `build` advertises the provider-agnostic `buzz-gif` extension and the
     /// relay-relative metadata search endpoint. It must never contain a
     /// provider credential.
-    pub fn build(
+    pub(crate) fn build(
         relay_self: Option<&str>,
         icon: Option<&str>,
-        advertise_nip43: bool,
+        flags: RelayCapabilityFlags,
         max_message_length: usize,
         pairing_relay_url: Option<&str>,
         admin_api: Option<&str>,
         gif_provider: Option<&str>,
-        advertise_fi: bool,
     ) -> Self {
+        let RelayCapabilityFlags {
+            advertise_nip43,
+            advertise_fi,
+        } = flags;
         debug_assert!(
             !advertise_nip43 || relay_self.is_some(),
             "advertise_nip43=true requires relay_self=Some — NIP-43 events are verified against `self`"
@@ -313,12 +329,14 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
     let mut info = RelayInfo::build(
         relay_self.as_deref(),
         icon.as_deref(),
-        advertise_nip43,
+        RelayCapabilityFlags {
+            advertise_nip43,
+            advertise_fi,
+        },
         state.config.max_frame_bytes,
         state.config.pairing_relay_url.as_deref(),
         admin_api.as_deref(),
         state.config.klipy.as_ref().map(|_| "klipy"),
-        advertise_fi,
     );
     let tenant_host = if state.config.push_enabled {
         crate::tenant::bind_community(&state.db, raw_host)
@@ -419,12 +437,11 @@ fn admin_api_advertisement(admin: Option<&crate::config::AdminConfig>) -> Option
 const _RELAY_INFO_BUILD_STATIC_INPUT_FENCE: fn(
     Option<&str>,
     Option<&str>,
-    bool,
+    RelayCapabilityFlags,
     usize,
     Option<&str>,
     Option<&str>,
     Option<&str>,
-    bool,
 ) -> RelayInfo = RelayInfo::build;
 
 #[cfg(test)]
@@ -482,12 +499,11 @@ mod tests {
         let info = RelayInfo::build(
             None,
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
         assert_eq!(info.software, "https://github.com/block/buzz");
     }
@@ -497,12 +513,11 @@ mod tests {
         let info = RelayInfo::build(
             None,
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             Some("wss://pairing.buzz.xyz"),
             None,
             None,
-            false,
         );
         let json = serde_json::to_value(&info).expect("serialize");
         assert_eq!(
@@ -514,12 +529,11 @@ mod tests {
         let info = RelayInfo::build(
             None,
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
         let json = serde_json::to_value(&info).expect("serialize");
         assert!(json.get("pairing_relay_url").is_none());
@@ -530,12 +544,11 @@ mod tests {
         let info = RelayInfo::build(
             None,
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             Some("klipy"),
-            false,
         );
 
         let json = serde_json::to_value(&info).expect("serialize");
@@ -551,12 +564,11 @@ mod tests {
         let unconfigured = RelayInfo::build(
             None,
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
         assert!(unconfigured.gif.is_none());
         assert!(!unconfigured
@@ -573,12 +585,11 @@ mod tests {
         let info = RelayInfo::build(
             None,
             Some("data:image/webp;base64,UklGRg=="),
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
         assert_eq!(
             info.icon.as_deref(),
@@ -594,12 +605,11 @@ mod tests {
             let info = RelayInfo::build(
                 None,
                 icon,
-                false,
+                RelayCapabilityFlags::default(),
                 DEFAULT_MAX_FRAME_BYTES,
                 None,
                 None,
                 None,
-                false,
             );
             assert!(info.icon.is_none());
             let json = serde_json::to_value(&info).expect("serialize");
@@ -620,7 +630,15 @@ mod tests {
 
     #[test]
     fn max_message_length_uses_configured_frame_limit() {
-        let info = RelayInfo::build(None, None, false, 262_144, None, None, None, false);
+        let info = RelayInfo::build(
+            None,
+            None,
+            RelayCapabilityFlags::default(),
+            262_144,
+            None,
+            None,
+            None,
+        );
         let limitation = info.limitation.expect("limitation");
         assert_eq!(limitation.max_message_length, Some(262_144));
     }
@@ -654,12 +672,11 @@ mod tests {
         let info = RelayInfo::build(
             None,
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
         assert!(info.relay_self.is_none());
         assert!(!info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
@@ -676,12 +693,11 @@ mod tests {
         let info = RelayInfo::build(
             Some(pk),
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
         assert_eq!(info.relay_self.as_deref(), Some(pk));
         assert!(!info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
@@ -694,12 +710,14 @@ mod tests {
         let info = RelayInfo::build(
             Some(pk),
             None,
-            true,
+            RelayCapabilityFlags {
+                advertise_nip43: true,
+                advertise_fi: false,
+            },
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
         assert_eq!(info.relay_self.as_deref(), Some(pk));
         assert!(info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
@@ -714,12 +732,14 @@ mod tests {
         let _ = RelayInfo::build(
             None,
             None,
-            true,
+            RelayCapabilityFlags {
+                advertise_nip43: true,
+                advertise_fi: false,
+            },
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
     }
 
@@ -740,12 +760,11 @@ mod tests {
         let info = RelayInfo::build(
             None,
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             None,
             None,
-            false,
         );
         assert!(info.admin_api.is_none());
         let json = serde_json::to_value(&info).expect("serialize");
@@ -766,12 +785,11 @@ mod tests {
         let info = RelayInfo::build(
             None,
             None,
-            false,
+            RelayCapabilityFlags::default(),
             DEFAULT_MAX_FRAME_BYTES,
             None,
             advertised.as_deref(),
             None,
-            false,
         );
         let json = serde_json::to_value(&info).expect("serialize");
         assert_eq!(

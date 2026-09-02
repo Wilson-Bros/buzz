@@ -1388,16 +1388,20 @@ impl AuditShutdownHandle {
 /// returned so `main.rs` can warm and periodically refresh the source while the
 /// relay uses the verifier for every WebSocket upgrade check.
 ///
+/// Named return type for [`build_nip_fi_components`].
+///
+/// Using a type alias avoids the `clippy::type_complexity` lint and names
+/// the NIP-FI component pair as a first-class concept.
+type NipFiComponents = (
+    Option<Arc<buzz_auth::FederatedAssertionVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
+    Option<Arc<buzz_auth::ProductionJwksSource>>,
+);
+
 /// The source starts empty; admission returns `authorization_unavailable`
 /// (503) until the startup warm in `main.rs` succeeds for at least one issuer.
 /// This is intentional: config validity must not be hostage to IdP availability
 /// at boot. [FI-TRACE-DEPENDENCY-FAIL-CLOSED]
-fn build_nip_fi_components(
-    config: &crate::config::Config,
-) -> (
-    Option<Arc<buzz_auth::FederatedAssertionVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
-    Option<Arc<buzz_auth::ProductionJwksSource>>,
-) {
+fn build_nip_fi_components(config: &crate::config::Config) -> NipFiComponents {
     use buzz_auth::{FederatedAssertionVerifier, HttpJwksFetcher, NipFiMode, ProductionJwksSource};
 
     if matches!(config.nip_fi.mode, NipFiMode::Off) {

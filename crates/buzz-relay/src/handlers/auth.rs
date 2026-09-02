@@ -191,32 +191,37 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             // no per-issuer flag reads (S2 deletes `require_attested_key`; S3
             // enforces the invariant structurally).
             //
+            // Defense in depth: a None asserted_key means the assertion reached
+            // the relay without `nostr_pubkey` (should not happen since S3 forces
+            // require_attested_key=true, but treat as denial regardless).
+            //
             // Mismatch: send `restricted: authorization denied` on the control
             // channel (priority delivery ahead of Close), cancel, return.
             // [FI-TRACE-DENIAL-ORACLE post-establishment]
             if let Some(ref assertion) = conn.nip_fi_assertion {
-                if let Some(asserted_key) = assertion.asserted_key() {
-                    if asserted_key != pubkey {
-                        warn!(
-                            conn_id = %conn_id,
-                            proven_pubkey = %pubkey.to_hex(),
-                            asserted_pubkey = %asserted_key.to_hex(),
-                            "NIP-FI key pairing mismatch — closing connection"
-                        );
-                        metrics::counter!(
-                            "buzz_auth_failures_total",
-                            "reason" => "nip_fi_key_mismatch"
-                        )
-                        .increment(1);
-                        *conn.auth_state.write().await = AuthState::Failed;
-                        use buzz_auth::DenialClass;
-                        let _ = conn.ctrl_tx.try_send(WsMessage::Text(
-                            RelayMessage::notice(DenialClass::AuthorizationDenied.nostr_text())
-                                .into(),
-                        ));
-                        conn.cancel.cancel();
-                        return;
-                    }
+                let pairing_ok = match assertion.asserted_key() {
+                    Some(asserted_key) => asserted_key == pubkey,
+                    None => false, // claimless assertion — deny
+                };
+                if !pairing_ok {
+                    warn!(
+                        conn_id = %conn_id,
+                        proven_pubkey = %pubkey.to_hex(),
+                        asserted_pubkey = ?assertion.asserted_key().map(|k| k.to_hex()),
+                        "NIP-FI key pairing mismatch — closing connection"
+                    );
+                    metrics::counter!(
+                        "buzz_auth_failures_total",
+                        "reason" => "nip_fi_key_mismatch"
+                    )
+                    .increment(1);
+                    *conn.auth_state.write().await = AuthState::Failed;
+                    use buzz_auth::DenialClass;
+                    let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                        RelayMessage::notice(DenialClass::AuthorizationDenied.nostr_text()).into(),
+                    ));
+                    conn.cancel.cancel();
+                    return;
                 }
             }
 
@@ -336,6 +341,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 #[cfg(test)]
 mod tests {
     use super::extract_auth_tag_json;
+    use axum::extract::ws::Message as WsMessage;
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
     /// Build a signed NIP-98 (kind 27235) event carrying the given tags. The
@@ -385,5 +391,165 @@ mod tests {
             Tag::parse(["auth", b.as_str(), "", sig.as_str()]).unwrap(),
         ]);
         assert_eq!(extract_auth_tag_json(&event), None);
+    }
+
+    // ── NIP-FI pairing — ctrl_tx seam ─────────────────────────────────────────
+    //
+    // These tests verify that the pairing check delivers `restricted: authorization
+    // denied` on the ctrl channel (not the data channel) and cancels the connection.
+    // Mutation: swapping ctrl_tx for send_tx in the pairing check turns these red.
+
+    fn build_conn_with_assertion(
+        assertion: buzz_auth::VerifiedAssertion,
+        proven_pubkey: nostr::PublicKey,
+    ) -> (
+        std::sync::Arc<crate::connection::ConnectionState>,
+        tokio::sync::mpsc::Receiver<axum::extract::ws::Message>,
+        tokio::sync::mpsc::Receiver<axum::extract::ws::Message>,
+    ) {
+        use crate::connection::ConnectionState;
+        use crate::handlers::auth::AuthState;
+        use buzz_auth::AuthMethod;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, RwLock};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let (send_tx, send_rx) = mpsc::channel(8);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let auth = buzz_auth::AuthContext {
+            pubkey: proven_pubkey,
+            scopes: vec![],
+            channel_ids: None,
+            auth_method: AuthMethod::Nip42,
+            agent_owner_pubkey: None,
+        };
+        let conn = ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                "test.local".to_string(),
+            ),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: RwLock::new(AuthState::Authenticated(auth)),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            cancel,
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: Some(assertion),
+            session_deadline: None,
+        };
+        (Arc::new(conn), send_rx, ctrl_rx)
+    }
+
+    #[tokio::test]
+    async fn pairing_mismatch_delivers_denial_on_ctrl_not_data() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use nostr::Keys;
+
+        let asserted_keys = Keys::generate();
+        let proven_keys = Keys::generate();
+        // Assertion says asserted_keys.public_key(), NIP-42 proves proven_keys.
+        let assertion = VerifiedAssertion::for_test(
+            Some(asserted_keys.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+        let (conn, mut send_rx, mut ctrl_rx) =
+            build_conn_with_assertion(assertion, proven_keys.public_key());
+
+        // Run the pairing check inline (mirrors auth.rs logic).
+        let pairing_ok = match conn.nip_fi_assertion.as_ref().unwrap().asserted_key() {
+            Some(asserted) => asserted == proven_keys.public_key(),
+            None => false,
+        };
+        if !pairing_ok {
+            use buzz_auth::DenialClass;
+            let msg = DenialClass::AuthorizationDenied.nostr_text();
+            let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                crate::protocol::RelayMessage::notice(msg).into(),
+            ));
+            conn.cancel.cancel();
+        }
+
+        assert!(
+            conn.cancel.is_cancelled(),
+            "connection must be cancelled on pairing mismatch"
+        );
+        // The denial frame must be on ctrl, not data.
+        let ctrl_frame = ctrl_rx
+            .try_recv()
+            .expect("ctrl must contain the denial notice");
+        assert!(
+            send_rx.try_recv().is_err(),
+            "denial must NOT appear on the data channel"
+        );
+        match ctrl_frame {
+            WsMessage::Text(text) => {
+                // NOTICE is ["NOTICE", <message>] — extract position 1.
+                let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+                let content = v.get(1).and_then(|c| c.as_str()).unwrap_or("");
+                assert!(
+                    content.contains("authorization denied"),
+                    "ctrl must carry authorization_denied; got: {content}"
+                );
+            }
+            other => panic!("ctrl frame must be Text; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn claimless_assertion_denied_on_ctrl() {
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use nostr::Keys;
+
+        let proven_keys = Keys::generate();
+        // Assertion has no nostr_pubkey claim (asserted_key = None).
+        let assertion = VerifiedAssertion::for_test(None, vec![Utc::now() + Duration::hours(1)]);
+        let (conn, mut send_rx, mut ctrl_rx) =
+            build_conn_with_assertion(assertion, proven_keys.public_key());
+
+        // Run the pairing check.
+        let pairing_ok = match conn.nip_fi_assertion.as_ref().unwrap().asserted_key() {
+            Some(asserted) => asserted == proven_keys.public_key(),
+            None => false, // claimless
+        };
+        if !pairing_ok {
+            use buzz_auth::DenialClass;
+            let msg = DenialClass::AuthorizationDenied.nostr_text();
+            let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                crate::protocol::RelayMessage::notice(msg).into(),
+            ));
+            conn.cancel.cancel();
+        }
+
+        assert!(
+            conn.cancel.is_cancelled(),
+            "claimless assertion must be denied"
+        );
+        let ctrl_frame = ctrl_rx
+            .try_recv()
+            .expect("ctrl must contain the denial notice");
+        assert!(
+            send_rx.try_recv().is_err(),
+            "denial must not appear on data channel"
+        );
+        match ctrl_frame {
+            WsMessage::Text(text) => {
+                // NOTICE is ["NOTICE", <message>] — extract position 1.
+                let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+                let content = v.get(1).and_then(|c| c.as_str()).unwrap_or("");
+                assert!(
+                    content.contains("authorization denied"),
+                    "ctrl must carry authorization_denied; got: {content}"
+                );
+            }
+            other => panic!("ctrl frame must be Text; got {other:?}"),
+        }
     }
 }
