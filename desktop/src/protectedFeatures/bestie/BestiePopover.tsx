@@ -346,7 +346,10 @@ export function BestiePopover({
     const trimmedDraft = draft.trim();
     if (!trimmedDraft) return;
     void (async () => {
-      await bestie.ensureAgentRunning();
+      const startResult = bestie.ensureAgentRunning().then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error }),
+      );
       const channel =
         conversationChannel ??
         (await (conversationPromiseRef.current ??
@@ -361,6 +364,8 @@ export function BestiePopover({
       });
       setContextSent(true);
       setDraft("");
+      const { error: startError } = await startResult;
+      if (startError) throw startError;
     })().catch((error) => {
       toast.error(
         error instanceof Error ? error.message : "Couldn’t message Bestie",
