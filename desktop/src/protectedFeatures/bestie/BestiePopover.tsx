@@ -14,12 +14,7 @@ import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { useProfileQuery } from "@/features/profile/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import type {
-  Channel,
-  ManagedAgent,
-  ManagedAgentRuntimeStatus,
-  PresenceStatus,
-} from "@/shared/api/types";
+import type { Channel, ManagedAgent, PresenceStatus } from "@/shared/api/types";
 import {
   KIND_STREAM_MESSAGE,
   KIND_STREAM_MESSAGE_V2,
@@ -30,14 +25,6 @@ import { Button } from "@/shared/ui/button";
 import { Textarea } from "@/shared/ui/textarea";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { useBestie } from "./useBestie";
-
-export function bestiePresenceStatus(
-  lifecycle: ManagedAgentRuntimeStatus["lifecycle"] | undefined,
-): PresenceStatus {
-  if (lifecycle === "ready" || lifecycle === "listening") return "online";
-  if (lifecycle === "starting" || lifecycle === "waking") return "away";
-  return "offline";
-}
 
 export function BestieTriggerVisual({
   agent,
@@ -341,7 +328,7 @@ export function BestiePopover({
   }
   if (!agent) return <EmptyBestie />;
 
-  const presenceStatus = bestiePresenceStatus(bestie.runtime?.lifecycle);
+  const presenceStatus = bestie.presenceStatus ?? "offline";
   const sendMessage = () => {
     const trimmedDraft = draft.trim();
     if (!trimmedDraft) return;

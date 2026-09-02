@@ -18,6 +18,7 @@ import {
 } from "@/features/channels/hooks";
 import { dmVisibilityQueryKeyFor } from "@/features/channels/useHiddenDmIds";
 import { useCommunities } from "@/features/communities/useCommunities";
+import { usePresenceQuery } from "@/features/presence/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { Channel, ManagedAgent } from "@/shared/api/types";
 import {
@@ -72,6 +73,13 @@ export function useBestie() {
         (agent) => agent.pubkey === assignmentQuery.data?.agentPubkey,
       ) ?? null)
     : null;
+  const presenceQuery = usePresenceQuery(
+    assignedAgent ? [assignedAgent.pubkey] : [],
+    { enabled: assignedAgent !== null },
+  );
+  const presenceStatus = assignedAgent
+    ? (presenceQuery.data?.[assignedAgent.pubkey.toLowerCase()] ?? "offline")
+    : undefined;
   const runtime = assignedAgent
     ? findManagedAgentRuntime(
         runtimesQuery.data ?? [],
@@ -158,6 +166,7 @@ export function useBestie() {
       runtimesQuery.isLoading,
     isOpening: resolveMutation.isPending || runtimeAction.isPending,
     openConversation,
+    presenceStatus,
     resolveConversation,
     runtime,
   };

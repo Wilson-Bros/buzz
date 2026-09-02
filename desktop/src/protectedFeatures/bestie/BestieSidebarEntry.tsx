@@ -3,7 +3,7 @@ import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
-import { BestieAgentLockup, bestiePresenceStatus } from "./BestiePopover";
+import { BestieAgentLockup } from "./BestiePopover";
 import { useBestie } from "./useBestie";
 
 export function BestieSidebarEntry() {
@@ -36,7 +36,7 @@ export function BestieSidebarEntry() {
           <BestieAgentLockup
             agent={bestie.assignedAgent}
             compact
-            presenceStatus={bestiePresenceStatus(bestie.runtime?.lifecycle)}
+            presenceStatus={bestie.presenceStatus ?? "offline"}
           />
         ) : (
           <>
