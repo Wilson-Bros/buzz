@@ -73,6 +73,10 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
     page.getByText("Choose a Bestie", { exact: true }),
   ).toBeVisible();
   await expect(page.getByText(/Open one of your local agents/)).toBeVisible();
+  await waitForAnimations(page);
+  await page.getByTestId("bestie-bloom-content").screenshot({
+    path: "test-results/bestie/00-empty-state.png",
+  });
   await page.keyboard.press("Escape");
 
   await page.getByTestId("open-agents-view").click();
@@ -82,6 +86,10 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   await bestieAction.click();
   const confirmation = page.getByTestId("bestie-confirm-dialog");
   await expect(confirmation).toContainText("Make Mochi your Bestie?");
+  await waitForAnimations(page);
+  await confirmation.screenshot({
+    path: "test-results/bestie/01-confirm-bestie.png",
+  });
   await confirmation.getByRole("button", { name: "Make Bestie" }).click();
   await expect(bestieAction).toContainText("Remove Bestie");
   await expect(
@@ -105,10 +113,10 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   ).toBe(true);
   await waitForAnimations(page);
   await page.getByTestId("sidebar-primary-menu").screenshot({
-    path: "test-results/bestie/00-sidebar-entry.png",
+    path: "test-results/bestie/02-sidebar-entry.png",
   });
   await page.getByTestId("user-profile-agent-management-section").screenshot({
-    path: "test-results/bestie/00-profile-actions.png",
+    path: "test-results/bestie/03-profile-actions.png",
   });
 
   await page.keyboard.press("Escape");
@@ -118,7 +126,7 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   ).toBeVisible();
   await waitForAnimations(page);
   await bestieCard.screenshot({
-    path: "test-results/bestie/00-bestie-card.png",
+    path: "test-results/bestie/04-bestie-card.png",
   });
 
   await floatingAvatar.click();
@@ -127,7 +135,7 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   await expect(page.getByText("Choose a different agent")).toHaveCount(0);
   await waitForAnimations(page);
   await page.getByTestId("bestie-bloom-content").screenshot({
-    path: "test-results/bestie/01-floating-popover.png",
+    path: "test-results/bestie/05-floating-popover.png",
   });
 
   const bloomContent = page.getByTestId("bestie-bloom-content");
@@ -251,6 +259,10 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   expect(snapshotBox?.width).toBeLessThanOrEqual(
     (popoverBox?.width ?? 0) * 0.75 + 1,
   );
+  await waitForAnimations(page);
+  await messagePopover.screenshot({
+    path: "test-results/bestie/06-message-handoff.png",
+  });
   const channelUrl = page.url();
   const miniComposer = messagePopover.getByLabel("Message Mochi");
   await miniComposer.fill("Give me a concise reply");
@@ -322,7 +334,7 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   await expect(miniTranscript).toContainText("One more thought");
   await waitForAnimations(page);
   await messagePopover.screenshot({
-    path: "test-results/bestie/02-message-popover.png",
+    path: "test-results/bestie/07-message-conversation.png",
   });
   await messagePopover.getByRole("button", { name: "Close Bestie" }).click();
   await expect(page.getByLabel("Message Mochi")).toHaveCount(0);
