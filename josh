@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CUSTOM_NAME="Josh"
+CUSTOM_BUILD_ID="6a6f736862757a7a"
+CUSTOM_PRODUCT_NAME="Buzz Josh"
+
+cd "$REPO_ROOT"
+
+activate_toolchain() {
+  # shellcheck source=/dev/null
+  source "$REPO_ROOT/bin/activate-hermit"
+}
+
+custom_config() {
+  local output_path="$1"
+  node desktop/scripts/demo-build-config.mjs \
+    "$CUSTOM_NAME" \
+    "$output_path" \
+    "$CUSTOM_BUILD_ID"
+}
+
+custom_slug() {
+  local config_json="$1"
+  node -e 'console.log(JSON.parse(process.argv[1]).slug)' "$config_json"
+}
+
+custom_app_path() {
+  local target="$1"
+  printf '%s\n' \
+    "$REPO_ROOT/desktop/src-tauri/target/$target/release/bundle/macos/$CUSTOM_PRODUCT_NAME.app"
+}
+
+build_custom_app() {
+  local target config_path config_json slug app_path plist_path
+  target="$(rustc -vV | sed -n 's/^host: //p')"
+  if [[ "$(uname -s)" != "Darwin" || "$target" != *-apple-darwin ]]; then
+    echo "The packaged Josh app currently supports macOS only." >&2
+    return 2
+  fi
+
+  config_path="$(mktemp "${TMPDIR:-/tmp}/buzz-josh-config.XXXXXX")"
+  trap 'rm -f "$config_path"' EXIT INT TERM
+  config_json="$(custom_config "$config_path")"
+  slug="$(custom_slug "$config_json")"
+
+  echo "Building the stable $CUSTOM_PRODUCT_NAME app identity ($slug)..."
+  cargo build --release --target "$target" \
+    -p buzz-acp \
+    -p buzz-agent \
+    -p buzz-backend-kubernetes \
+    -p buzz-dev-mcp \
+    -p git-credential-nostr \
+    -p buzz-cli
+  ./scripts/bundle-sidecars.sh "$target"
+  pnpm install --frozen-lockfile
+  (
+    cd desktop
+    BUZZ_BUILD_DEMO_SLUG="$slug" \
+      pnpm tauri build --target "$target" --bundles app --config "$config_path"
+  )
+
+  app_path="$(custom_app_path "$target")"
+  if [[ ! -d "$app_path" ]]; then
+    echo "Build finished without producing the expected app: $app_path" >&2
+    return 1
+  fi
+  plist_path="$app_path/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c \
+    "Set :CFBundleDisplayName $CUSTOM_PRODUCT_NAME" "$plist_path"
+  /usr/libexec/PlistBuddy -c \
+    "Set :CFBundleName $CUSTOM_PRODUCT_NAME" "$plist_path"
+  codesign --force --deep --sign - "$app_path"
+  rm -f "$config_path"
+  trap - EXIT INT TERM
+  echo "Built: $app_path"
+}
+
+install_custom_app() {
+  local target app_path applications_dir destination
+  build_custom_app
+  target="$(rustc -vV | sed -n 's/^host: //p')"
+  app_path="$(custom_app_path "$target")"
+  applications_dir="${HOME}/Applications"
+  destination="$applications_dir/$CUSTOM_PRODUCT_NAME.app"
+  mkdir -p "$applications_dir"
+  ditto "$app_path" "$destination"
+  echo "Installed: $destination"
+  echo "Open it with: ./josh open"
+}
+
+sync_upstream() {
+  if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Commit or stash local changes before syncing upstream." >&2
+    return 1
+  fi
+  git fetch upstream main
+  git rebase upstream/main
+}
+
+print_help() {
+  cat <<'EOF'
+Josh's Buzz fork helper
+
+Usage: ./josh <command> [args]
+
+  setup    Download the pinned toolchain and install JS dependencies
+  dev      Run the mutable desktop app with isolated development state
+  check    Run desktop lint, tests, type checks, and frontend build
+  build    Build a stable, isolated "Buzz Josh.app" bundle
+  install  Build and copy "Buzz Josh.app" into ~/Applications
+  open     Open the installed "Buzz Josh.app"
+  sync     Rebase a clean branch onto the latest official upstream/main
+  status   Show branch, working-tree, and upstream divergence
+  help     Show this help
+
+The official Buzz app, production keychain entry, and ~/.buzz are never copied
+or modified by these commands. Buzz Josh has its own app identity and state.
+EOF
+}
+
+command="${1:-help}"
+shift || true
+
+case "$command" in
+  setup)
+    activate_toolchain
+    just bootstrap
+    just desktop-install-ci
+    just hooks
+    ;;
+  dev)
+    activate_toolchain
+    exec just desktop-standalone "$@"
+    ;;
+  check)
+    activate_toolchain
+    just desktop-check
+    just desktop-test
+    just desktop-typecheck
+    just desktop-build
+    ;;
+  build)
+    activate_toolchain
+    build_custom_app
+    ;;
+  install)
+    activate_toolchain
+    install_custom_app
+    ;;
+  open)
+    open "${HOME}/Applications/$CUSTOM_PRODUCT_NAME.app"
+    ;;
+  sync)
+    sync_upstream
+    ;;
+  status)
+    git status --short --branch
+    git rev-list --left-right --count HEAD...upstream/main
+    ;;
+  help|-h|--help)
+    print_help
+    ;;
+  *)
+    echo "Unknown command: $command" >&2
+    print_help >&2
+    exit 2
+    ;;
+esac
