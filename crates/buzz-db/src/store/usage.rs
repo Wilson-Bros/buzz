@@ -417,9 +417,11 @@ impl Db {
         &self,
         lock_key: i64,
     ) -> Result<Option<UsageMetricsLeader>> {
-        let mut connection =
-            observability::acquire_writer(&self.pool, observability::WriterOperation::Maintenance)
-                .await?;
+        let mut connection = observability::acquire_writer_with_legacy_metrics(
+            &self.pool,
+            observability::WriterOperation::Maintenance,
+        )
+        .await?;
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&mut *connection)

@@ -89,7 +89,7 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(observability.contains("Self::WriterAuthentication"));
     assert!(observability.contains("Self::ReaderSubscriptionHistory"));
     assert!(observability.contains("pub(crate) async fn acquire_writer("));
-    assert!(observability.contains("pub(super) async fn acquire_reader("));
+    assert!(observability.contains("pub(super) async fn acquire_reader_with_legacy_metrics("));
     assert!(observability.contains("static POOL_WAITERS: [Mutex<u64>"));
     assert!(!observability.contains("AtomicU64"));
     assert!(!observability.contains("DbOperation::Other"));
@@ -150,6 +150,65 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(!thread_metadata.contains("fetch_optional(pool)"));
 
     let channel = include_str!("../src/store/channel.rs");
+    assert!(channel.contains("async fn begin_event_write_transaction("));
+    assert!(channel.contains("async fn acquire_event_write_connection("));
+    for (start, end, expected) in [
+        (
+            "pub async fn create_channel(\n",
+            "/// Creates a channel with a client-supplied UUID",
+            "begin_event_write_transaction(pool)",
+        ),
+        (
+            "pub async fn create_channel_with_id(\n",
+            "/// Fetches a channel record by `(community_id, id)`",
+            "begin_event_write_transaction(pool)",
+        ),
+        (
+            "pub async fn update_channel(\n",
+            "/// Sets the topic for a channel",
+            "begin_event_write_transaction(pool)",
+        ),
+        (
+            "pub async fn set_topic(\n",
+            "/// Sets the purpose for a channel",
+            "acquire_event_write_connection(pool)",
+        ),
+        (
+            "pub async fn set_purpose(\n",
+            "/// Archives a channel",
+            "acquire_event_write_connection(pool)",
+        ),
+        (
+            "pub async fn archive_channel(\n",
+            "/// Unarchives a channel",
+            "acquire_event_write_connection(pool)",
+        ),
+        (
+            "pub async fn unarchive_channel(\n",
+            "/// Soft-delete a channel",
+            "acquire_event_write_connection(pool)",
+        ),
+        (
+            "pub async fn soft_delete_channel(\n",
+            "/// Archive ephemeral channels",
+            "acquire_event_write_connection(pool)",
+        ),
+    ] {
+        let function = channel
+            .split_once(start)
+            .unwrap_or_else(|| panic!("missing channel seam {start}"))
+            .1
+            .split_once(end)
+            .unwrap_or_else(|| panic!("channel seam {start} must precede {end}"))
+            .0;
+        assert!(
+            function.contains(expected),
+            "channel seam {start} must use {expected}"
+        );
+        assert!(!function.contains("pool.begin().await"));
+        assert!(!function.contains(".execute(pool)"));
+        assert!(!function.contains(".fetch_optional(pool)"));
+    }
     let get_channel = channel
         .split_once("async fn get_channel_with_operation(")
         .expect("channel store must route shared lookups through caller-owned intent")
@@ -390,6 +449,43 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
         .0;
     assert!(lease_stats.contains("WriterOperation::Maintenance"));
     assert!(lease_stats.contains("fetch_one(&mut *connection)"));
+    for (start, end) in [
+        (
+            "pub async fn acquire_serving_write_lease",
+            "/// Renew an already-admitted external side-effect lease",
+        ),
+        (
+            "pub async fn renew_serving_write_lease",
+            "/// Release a serving side-effect lease",
+        ),
+        (
+            "pub async fn release_serving_write_lease",
+            "/// Check that an external side-effect lease remains current",
+        ),
+        (
+            "pub async fn verify_serving_write_lease",
+            "/// Delete expired serving leases",
+        ),
+        (
+            "pub async fn is_serving_active",
+            "async fn advance_with_checkpoint",
+        ),
+    ] {
+        let function = deletion
+            .split_once(start)
+            .unwrap_or_else(|| panic!("missing serving-write seam {start}"))
+            .1
+            .split_once(end)
+            .unwrap_or_else(|| panic!("serving-write seam {start} must precede {end}"))
+            .0;
+        assert!(
+            function.contains("WriterOperation::EventWrite"),
+            "serving-write seam {start} must be event-write attributed"
+        );
+        assert!(!function.contains("self.pool.begin().await"));
+        assert!(!function.contains(".execute(&self.pool)"));
+        assert!(!function.contains(".fetch_one(&self.pool)"));
+    }
 
     let ensure_authorization = user
         .split_once("pub async fn ensure_user_for_authorization(")
@@ -419,6 +515,7 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
         ("archived_identities", archived_identities),
         ("event", event),
         ("git_repo", include_str!("../src/store/git_repo.rs")),
+        ("push", include_str!("../src/store/push.rs")),
         ("replica_fence", replica_fence),
         ("reaction", include_str!("../src/store/reaction.rs")),
         ("relay_invite", include_str!("../src/store/relay_invite.rs")),
@@ -426,6 +523,7 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
             "relay_members",
             include_str!("../src/store/relay_members.rs"),
         ),
+        ("thread", thread),
         (
             "relay_operators",
             include_str!("../src/store/relay_operators.rs"),

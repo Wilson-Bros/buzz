@@ -82,7 +82,7 @@ where
     F: FnOnce(PgConnection) -> Fut,
     Fut: Future<Output = (PgConnection, Result<T>)>,
 {
-    let mut lock_conn = crate::observability::acquire_writer(
+    let mut lock_conn = crate::observability::acquire_writer_with_legacy_metrics(
         pool,
         crate::observability::WriterOperation::Bootstrap,
     )

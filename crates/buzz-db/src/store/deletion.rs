@@ -647,15 +647,27 @@ impl Db {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
-        let mut connection = crate::observability::acquire_writer_until(
+        let mut connection = match crate::observability::acquire_writer_until(
             &self.pool,
             crate::observability::WriterOperation::Readiness,
             deadline,
         )
-        .await?;
-        self.deletion_store()
-            .validate_serving_catalog_on(&mut connection)
-            .await
+        .await
+        {
+            Ok(connection) => connection,
+            Err(sqlx::Error::PoolTimedOut) => return Err(DbError::DeadlineExceeded),
+            Err(error) => return Err(error.into()),
+        };
+        match tokio::time::timeout_at(
+            deadline,
+            self.deletion_store()
+                .validate_serving_catalog_on(&mut connection),
+        )
+        .await
+        {
+            Err(_) => Err(DbError::DeadlineExceeded),
+            Ok(result) => result,
+        }
     }
 
     /// Validate the exact live community-deletion tenant catalog for destruction.
@@ -2390,7 +2402,12 @@ impl DeletionStore {
         lease_duration: Duration,
     ) -> Result<ServingWriteLease> {
         let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
-        let mut tx = self.pool.begin().await?;
+        let connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?;
+        let mut tx = sqlx::Transaction::begin(connection, None).await?;
         // The assertion owns both the shared ordering lock and the supported
         // READ COMMITTED check. The lease table is trigger-excluded, so this
         // explicit admission is its database-enforced write fence.
@@ -2454,7 +2471,12 @@ impl DeletionStore {
         lease_duration: Duration,
     ) -> Result<()> {
         let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
-        let mut tx = self.pool.begin().await?;
+        let connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?;
+        let mut tx = sqlx::Transaction::begin(connection, None).await?;
         lock_community_deletion_shared(&mut tx, lease.community_id).await?;
         let lease_until: Option<DateTime<Utc>> = sqlx::query_scalar(
             "UPDATE community_serving_write_leases lease \
@@ -2487,6 +2509,11 @@ impl DeletionStore {
 
     /// Release a serving side-effect lease. A stale release is harmless.
     pub async fn release_serving_write_lease(&self, lease: &ServingWriteLease) -> Result<bool> {
+        let mut connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?;
         let deleted = sqlx::query(
             "DELETE FROM community_serving_write_leases \
              WHERE id = $1 AND community_id = $2 AND owner = $3 AND generation = $4 \
@@ -2497,7 +2524,7 @@ impl DeletionStore {
         .bind(&lease.owner)
         .bind(lease.generation)
         .bind(lease.fence_generation)
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await?
         .rows_affected();
         Ok(deleted == 1)
@@ -2509,7 +2536,12 @@ impl DeletionStore {
     /// work remains blocked, preserving an accurate drain without abandoning an
     /// admitted remote effect.
     pub async fn verify_serving_write_lease(&self, lease: &ServingWriteLease) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?;
+        let mut tx = sqlx::Transaction::begin(connection, None).await?;
         lock_community_deletion_shared(&mut tx, lease.community_id).await?;
         let valid: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM community_serving_write_leases lease \
@@ -2586,12 +2618,17 @@ impl DeletionStore {
 
     /// Whether a community remains active and serving-write eligible.
     pub async fn is_serving_active(&self, community: CommunityId) -> Result<bool> {
+        let mut connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?;
         sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 \
              AND archived_at IS NULL AND deleted_at IS NULL AND deletion_state = 'active')",
         )
         .bind(community.as_uuid())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *connection)
         .await
         .map_err(Into::into)
     }

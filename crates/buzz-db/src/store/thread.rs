@@ -11,6 +11,23 @@ use uuid::Uuid;
 
 use buzz_datastore_tracing::datastore_span;
 
+async fn acquire_event_write_connection(
+    pool: &PgPool,
+) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    Ok(crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?)
+}
+
+async fn begin_event_write_transaction(
+    pool: &PgPool,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let connection = acquire_event_write_connection(pool).await?;
+    Ok(sqlx::Transaction::begin(connection, None).await?)
+}
+
 use buzz_core::CommunityId;
 
 use crate::{
@@ -131,7 +148,7 @@ pub async fn insert_thread_metadata(
     depth: i32,
     broadcast: bool,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_event_write_transaction(pool).await?;
 
     let result = sqlx::query(
         r#"
@@ -259,6 +276,7 @@ pub async fn increment_reply_count(
     parent_event_id: &[u8],
     root_event_id: Option<&[u8]>,
 ) -> Result<()> {
+    let mut connection = acquire_event_write_connection(pool).await?;
     // Always bump the parent's direct reply count and last-reply timestamp.
     sqlx::query(
         r#"
@@ -270,7 +288,7 @@ pub async fn increment_reply_count(
     )
     .bind(community_id.as_uuid())
     .bind(parent_event_id)
-    .execute(pool)
+    .execute(&mut *connection)
     .await?;
 
     // Always bump root's descendant_count, regardless of whether root == parent.
@@ -284,7 +302,7 @@ pub async fn increment_reply_count(
         )
         .bind(community_id.as_uuid())
         .bind(root_id)
-        .execute(pool)
+        .execute(&mut *connection)
         .await?;
     }
 
@@ -300,6 +318,7 @@ pub async fn decrement_reply_count(
     parent_event_id: &[u8],
     root_event_id: Option<&[u8]>,
 ) -> Result<()> {
+    let mut connection = acquire_event_write_connection(pool).await?;
     // Always decrement the parent's direct reply count (floor at 0).
     sqlx::query(
         r#"
@@ -310,7 +329,7 @@ pub async fn decrement_reply_count(
     )
     .bind(community_id.as_uuid())
     .bind(parent_event_id)
-    .execute(pool)
+    .execute(&mut *connection)
     .await?;
 
     // Always decrement root's descendant_count, regardless of whether root == parent.
@@ -324,7 +343,7 @@ pub async fn decrement_reply_count(
         )
         .bind(community_id.as_uuid())
         .bind(root_id)
-        .execute(pool)
+        .execute(&mut *connection)
         .await?;
     }
 

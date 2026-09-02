@@ -261,12 +261,16 @@ impl TransactionOperation {
     }
 }
 
-fn record_pool_acquire(pair: PoolOperation, outcome: Outcome, elapsed: Duration) {
-    // Keep the original two metrics stable for existing dashboards while the
-    // operation-aware series are rolled out and validated in staging. The
-    // compatibility contract has no cancelled outcome, so only completed
-    // attempts enter those legacy families.
-    if outcome != Outcome::Cancelled {
+fn record_pool_acquire(
+    pair: PoolOperation,
+    outcome: Outcome,
+    elapsed: Duration,
+    emit_legacy: bool,
+) {
+    // Preserve the original observed population for existing dashboards.
+    // Newly instrumented raw-pool seams must not create a deployment-time
+    // discontinuity in these compatibility families.
+    if emit_legacy && outcome != Outcome::Cancelled {
         metrics::histogram!(
             "buzz_db_pool_acquire_wait_seconds",
             "pool_role" => pair.pool_role(),
@@ -298,6 +302,9 @@ fn record_pool_acquire(pair: PoolOperation, outcome: Outcome, elapsed: Duration)
 
 static POOL_WAITERS: [Mutex<u64>; PoolOperation::ALL.len()] =
     [const { Mutex::new(0) }; PoolOperation::ALL.len()];
+
+#[cfg(test)]
+static POOL_METRICS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn publish_waiters(pair: PoolOperation, value: u64) {
     metrics::gauge!(
@@ -331,11 +338,12 @@ pub(crate) fn refresh_pool_waiters(include_reader: bool) {
 struct PoolAcquireAttempt {
     pair: PoolOperation,
     started: Instant,
+    emit_legacy: bool,
     terminal: bool,
 }
 
 impl PoolAcquireAttempt {
-    fn start(pair: PoolOperation) -> Self {
+    fn start(pair: PoolOperation, emit_legacy: bool) -> Self {
         {
             let mut waiters = POOL_WAITERS[pair.index()]
                 .lock()
@@ -346,13 +354,14 @@ impl PoolAcquireAttempt {
         Self {
             pair,
             started: Instant::now(),
+            emit_legacy,
             terminal: false,
         }
     }
 
     fn finish(mut self, outcome: Outcome) {
         self.terminal = true;
-        record_pool_acquire(self.pair, outcome, self.started.elapsed());
+        record_pool_acquire(self.pair, outcome, self.started.elapsed(), self.emit_legacy);
         self.release_waiter();
     }
 
@@ -369,7 +378,12 @@ impl PoolAcquireAttempt {
 impl Drop for PoolAcquireAttempt {
     fn drop(&mut self) {
         if !self.terminal {
-            record_pool_acquire(self.pair, Outcome::Cancelled, self.started.elapsed());
+            record_pool_acquire(
+                self.pair,
+                Outcome::Cancelled,
+                self.started.elapsed(),
+                self.emit_legacy,
+            );
             self.release_waiter();
             self.terminal = true;
         }
@@ -379,8 +393,9 @@ impl Drop for PoolAcquireAttempt {
 async fn acquire(
     pool: &sqlx::PgPool,
     pair: PoolOperation,
+    emit_legacy: bool,
 ) -> sqlx::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
-    let attempt = PoolAcquireAttempt::start(pair);
+    let attempt = PoolAcquireAttempt::start(pair, emit_legacy);
     let result = pool.acquire().await;
     let outcome = result
         .as_ref()
@@ -395,16 +410,23 @@ pub(crate) async fn acquire_writer(
     pool: &sqlx::PgPool,
     operation: WriterOperation,
 ) -> sqlx::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
-    acquire(pool, operation.pair()).await
+    acquire(pool, operation.pair(), false).await
 }
 
-/// Acquire from the configured read pool. Kept visible only to the runtime
-/// owner that holds `Db::read_pool`; store modules cannot forge reader labels.
-pub(super) async fn acquire_reader(
+/// Acquire from a writer seam already covered by the pre-operation metric.
+pub(crate) async fn acquire_writer_with_legacy_metrics(
+    pool: &sqlx::PgPool,
+    operation: WriterOperation,
+) -> sqlx::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    acquire(pool, operation.pair(), true).await
+}
+
+/// Acquire from a reader seam already covered by the pre-operation metric.
+pub(super) async fn acquire_reader_with_legacy_metrics(
     pool: &sqlx::PgPool,
     operation: ReaderOperation,
 ) -> sqlx::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
-    acquire(pool, operation.pair()).await
+    acquire(pool, operation.pair(), true).await
 }
 
 /// Acquire within an operation-owned absolute deadline.
@@ -417,7 +439,7 @@ pub(crate) async fn acquire_writer_until(
     deadline: tokio::time::Instant,
 ) -> sqlx::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
     let pair = operation.pair();
-    let attempt = PoolAcquireAttempt::start(pair);
+    let attempt = PoolAcquireAttempt::start(pair, false);
     match tokio::time::timeout_at(deadline, pool.acquire()).await {
         Err(_) => {
             attempt.finish(Outcome::Timeout);
@@ -438,7 +460,7 @@ pub(crate) async fn begin_transaction(
     pool: &sqlx::PgPool,
     operation: TransactionOperation,
 ) -> sqlx::Result<(sqlx::Transaction<'static, sqlx::Postgres>, TransactionTimer)> {
-    let connection = acquire_writer(pool, operation.writer_operation()).await?;
+    let connection = acquire_writer_with_legacy_metrics(pool, operation.writer_operation()).await?;
     let transaction = sqlx::Transaction::begin(connection, None).await?;
     Ok((transaction, TransactionTimer::start(operation)))
 }
@@ -509,12 +531,14 @@ impl Drop for TransactionTimer {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_reader, acquire_writer, observe_advisory_lock, record_pool_acquire,
-        refresh_pool_waiters, LockType, Outcome, PoolAcquireAttempt, PoolOperation,
-        ReaderOperation, TransactionOperation, TransactionTimer, WriterOperation,
+        acquire_reader_with_legacy_metrics, acquire_writer, acquire_writer_with_legacy_metrics,
+        observe_advisory_lock, record_pool_acquire, refresh_pool_waiters, LockType, Outcome,
+        PoolAcquireAttempt, PoolOperation, ReaderOperation, TransactionOperation, TransactionTimer,
+        WriterOperation,
     };
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     #[test]
@@ -628,11 +652,13 @@ mod tests {
             PoolOperation::WriterReadiness,
             Outcome::Success,
             Duration::from_millis(12),
+            false,
         );
         record_pool_acquire(
             PoolOperation::ReaderSubscriptionHistory,
             Outcome::Timeout,
             Duration::from_millis(34),
+            true,
         );
         let lock_ok: sqlx::Result<()> =
             observe_advisory_lock(LockType::Replacement, async { Ok(()) }).await;
@@ -669,15 +695,7 @@ mod tests {
         for expected in [
             (
                 "buzz_db_pool_acquire_wait_seconds",
-                [("outcome", "success"), ("pool_role", "writer")],
-            ),
-            (
-                "buzz_db_pool_acquire_wait_seconds",
                 [("outcome", "timeout"), ("pool_role", "reader")],
-            ),
-            (
-                "buzz_db_pool_acquisitions_total",
-                [("outcome", "success"), ("pool_role", "writer")],
             ),
             (
                 "buzz_db_pool_acquisitions_total",
@@ -722,6 +740,23 @@ mod tests {
             assert!(
                 keys.contains(&(expected.0.to_owned(), expected_labels)),
                 "missing metric series {expected:?}; got {keys:?}"
+            );
+        }
+        for name in [
+            "buzz_db_pool_acquire_wait_seconds",
+            "buzz_db_pool_acquisitions_total",
+        ] {
+            assert!(
+                !keys.contains(&(
+                    name.to_owned(),
+                    [
+                        ("outcome".to_owned(), "success".to_owned()),
+                        ("pool_role".to_owned(), "writer".to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )),
+                "newly instrumented seams must not expand legacy metric population"
             );
         }
 
@@ -784,11 +819,12 @@ mod tests {
 
     #[test]
     fn cancelled_attempt_records_terminal_and_refreshes_zero() {
+        let _test_guard = super::POOL_METRICS_TEST_LOCK.blocking_lock();
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let attempt = PoolAcquireAttempt::start(PoolOperation::WriterTenantResolution);
+        let attempt = PoolAcquireAttempt::start(PoolOperation::WriterTenantResolution, false);
         drop(attempt);
         refresh_pool_waiters(true);
 
@@ -828,6 +864,7 @@ mod tests {
 
     #[test]
     fn waiter_refresh_omits_reader_pairs_when_no_reader_pool_is_configured() {
+        let _test_guard = super::POOL_METRICS_TEST_LOCK.blocking_lock();
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
@@ -866,13 +903,138 @@ mod tests {
         assert!(published.iter().all(|(pool_role, _)| pool_role == "writer"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn compatibility_metrics_only_cover_preexisting_acquisition_seams() {
+        let _test_guard = super::POOL_METRICS_TEST_LOCK.lock().await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(&crate::test_support::database_url())
+            .expect("construct lazy compatibility test pool");
+        pool.close().await;
+
+        let error = acquire_writer(&pool, WriterOperation::EventWrite)
+            .await
+            .expect_err("closed newly instrumented seam errors");
+        assert!(matches!(error, sqlx::Error::PoolClosed));
+        assert_eq!(
+            legacy_acquisition_count(&snapshotter.snapshot().into_vec()),
+            0
+        );
+
+        let error = acquire_writer_with_legacy_metrics(&pool, WriterOperation::EventWrite)
+            .await
+            .expect_err("closed legacy seam errors");
+        assert!(matches!(error, sqlx::Error::PoolClosed));
+        assert_eq!(
+            legacy_acquisition_count(&snapshotter.snapshot().into_vec()),
+            1
+        );
+    }
+
+    fn legacy_acquisition_count(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+    ) -> u64 {
+        snapshot
+            .iter()
+            .find_map(|(key, _, _, value)| {
+                (key.key().name() == "buzz_db_pool_acquisitions_total")
+                    .then_some(value)
+                    .map(|value| match value {
+                        DebugValue::Counter(value) => *value,
+                        _ => panic!("legacy acquisitions must be a counter"),
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn concurrent_attempts_publish_an_exact_balanced_waiter_count() {
+        const ATTEMPTS: usize = 8;
+
+        let _test_guard = super::POOL_METRICS_TEST_LOCK.blocking_lock();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let armed = Arc::new(Barrier::new(ATTEMPTS + 1));
+        let release = Arc::new(Barrier::new(ATTEMPTS + 1));
+        let threads = (0..ATTEMPTS)
+            .map(|_| {
+                let armed = Arc::clone(&armed);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    let attempt =
+                        PoolAcquireAttempt::start(PoolOperation::WriterTenantResolution, false);
+                    armed.wait();
+                    release.wait();
+                    drop(attempt);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        armed.wait();
+        refresh_pool_waiters(true);
+        let live = waiter_value(
+            &snapshotter.snapshot().into_vec(),
+            "writer",
+            "tenant_resolution",
+        );
+        assert_eq!(live, Some(ATTEMPTS as f64));
+
+        release.wait();
+        for thread in threads {
+            thread.join().expect("waiter thread completes");
+        }
+        refresh_pool_waiters(true);
+        let balanced = waiter_value(
+            &snapshotter.snapshot().into_vec(),
+            "writer",
+            "tenant_resolution",
+        );
+        assert_eq!(balanced, Some(0.0));
+    }
+
+    fn waiter_value(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        pool_role: &str,
+        operation: &str,
+    ) -> Option<f64> {
+        snapshot.iter().find_map(|(key, _, _, value)| {
+            let labels = key.key().labels().collect::<Vec<_>>();
+            if key.key().name() != "buzz_db_pool_waiters"
+                || !labels
+                    .iter()
+                    .any(|label| label.key() == "pool_role" && label.value() == pool_role)
+                || !labels
+                    .iter()
+                    .any(|label| label.key() == "operation" && label.value() == operation)
+            {
+                return None;
+            }
+            let DebugValue::Gauge(value) = value else {
+                panic!("pool waiters must be gauges");
+            };
+            Some(value.into_inner())
+        })
+    }
+
     async fn pool_acquire_records_success_timeout_and_error_with_wait_time() {
         // This timeout also bounds the pool's initial connection. Leave enough
         // headroom for a cold PostgreSQL start under the lane's eight workers;
         // the assertion below cares about classification, not a sub-second
         // synthetic timeout budget.
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned()); // sadscan:disable np.postgres.1 -- local test-only credentials
+        let database_url = crate::test_support::database_url();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(5))
@@ -889,7 +1051,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let held = acquire_writer(&pool, WriterOperation::EventWrite)
+        let held = acquire_writer_with_legacy_metrics(&pool, WriterOperation::EventWrite)
             .await
             .expect("writer acquire succeeds");
         let mut cancelled = Box::pin(acquire_writer(&pool, WriterOperation::Authentication));
@@ -970,14 +1132,15 @@ mod tests {
             .acquire()
             .await
             .expect("hold the reader test connection");
-        let timeout = acquire_reader(&reader_pool, ReaderOperation::SubscriptionHistory)
-            .await
-            .expect_err("reader-labeled checkout times out while pool is saturated");
+        let timeout =
+            acquire_reader_with_legacy_metrics(&reader_pool, ReaderOperation::SubscriptionHistory)
+                .await
+                .expect_err("reader-labeled checkout times out while pool is saturated");
         assert!(matches!(timeout, sqlx::Error::PoolTimedOut));
         drop(held_reader);
         drop(held);
         pool.close().await;
-        let closed = acquire_writer(&pool, WriterOperation::Readiness)
+        let closed = acquire_writer_with_legacy_metrics(&pool, WriterOperation::Readiness)
             .await
             .expect_err("closed pool acquire errors");
         assert!(matches!(closed, sqlx::Error::PoolClosed));
@@ -1024,8 +1187,7 @@ mod tests {
         use chrono::Utc;
         use uuid::Uuid;
 
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned()); // sadscan:disable np.postgres.1 -- local test-only credentials
+        let database_url = crate::test_support::database_url();
         let writer_pool = crate::Db::connect_writer_pool(&crate::DbConfig {
             database_url: database_url.clone(),
             max_connections: 4,
@@ -1238,9 +1400,118 @@ mod tests {
         assert_eq!(waiter_labels, expected);
     }
 
+    async fn serving_write_gate_records_cancel_timeout_success_and_recovery() {
+        let _test_guard = super::POOL_METRICS_TEST_LOCK.lock().await;
+        let database_url = crate::test_support::database_url();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            // The same budget also covers the pool's initial physical
+            // connection. Keep enough headroom for a cold CI database; the
+            // held size-one connection below still deterministically drives
+            // the checkout timeout terminal.
+            .acquire_timeout(Duration::from_secs(1))
+            .connect(&database_url)
+            .await
+            .expect("connect size-one serving-write test pool");
+        let db = crate::Db::from_pool(pool.clone());
+        if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+            db.migrate().await.expect("migrate serving-write test DB");
+        }
+        let test_scope = db
+            .ensure_configured_community(&format!(
+                "pool-observability-{}.example",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .await
+            .expect("create serving-write test community")
+            .id;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let held = pool.acquire().await.expect("hold sole writer connection");
+
+        let store = db.deletion_store();
+        let mut cancelled = Box::pin(store.is_serving_active(test_scope));
+        tokio::select! {
+            result = &mut cancelled => panic!("blocked serving-write gate unexpectedly completed: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+        assert_eq!(
+            waiter_value(&snapshotter.snapshot().into_vec(), "writer", "event_write"),
+            Some(1.0)
+        );
+        drop(cancelled);
+
+        let timeout = store
+            .is_serving_active(test_scope)
+            .await
+            .expect_err("saturated serving-write gate times out");
+        assert!(matches!(
+            timeout,
+            crate::DbError::Sqlx(sqlx::Error::PoolTimedOut)
+        ));
+        drop(held);
+
+        assert!(store
+            .is_serving_active(test_scope)
+            .await
+            .expect("serving-write gate recovers after release"));
+        let lease = store
+            .acquire_serving_write_lease(
+                test_scope,
+                "pool_observability",
+                "pool-observability-test",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("serving-write lease acquires through event-write seam");
+        assert!(store
+            .release_serving_write_lease(&lease)
+            .await
+            .expect("serving-write lease release"));
+        refresh_pool_waiters(false);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(waiter_value(&snapshot, "writer", "event_write"), Some(0.0));
+        assert_eq!(attempt_count(&snapshot, "event_write", "cancelled"), 1);
+        assert_eq!(attempt_count(&snapshot, "event_write", "timeout"), 1);
+        assert!(
+            attempt_count(&snapshot, "event_write", "success") >= 3,
+            "gate recovery plus lease acquire/release must emit successes"
+        );
+    }
+
+    fn attempt_count(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        operation: &str,
+        outcome: &str,
+    ) -> u64 {
+        snapshot
+            .iter()
+            .find_map(|(key, _, _, value)| {
+                let labels = key.key().labels().collect::<Vec<_>>();
+                (key.key().name() == "buzz_db_pool_acquire_attempts_total"
+                    && labels
+                        .iter()
+                        .any(|label| label.key() == "operation" && label.value() == operation)
+                    && labels
+                        .iter()
+                        .any(|label| label.key() == "outcome" && label.value() == outcome))
+                .then(|| match value {
+                    DebugValue::Counter(value) => *value,
+                    _ => panic!("pool attempts must be a counter"),
+                })
+            })
+            .unwrap_or(0)
+    }
+
     async fn advisory_lock_records_success_contention_timeout_and_error() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned()); // sadscan:disable np.postgres.1 -- local test-only credentials
+        let database_url = crate::test_support::database_url();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .connect(&database_url)
@@ -1391,6 +1662,12 @@ mod tests {
         #[ignore = "requires Postgres"]
         async fn production_db_methods_emit_exact_pool_operation_labels() {
             super::production_db_methods_emit_exact_pool_operation_labels().await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        #[ignore = "requires Postgres"]
+        async fn serving_write_gate_records_cancel_timeout_success_and_recovery() {
+            super::serving_write_gate_records_cancel_timeout_success_and_recovery().await;
         }
 
         #[tokio::test(flavor = "current_thread")]

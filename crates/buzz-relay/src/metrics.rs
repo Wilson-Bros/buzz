@@ -41,6 +41,7 @@ const READINESS_DURATION_BUCKETS_S: [f64; 15] = [
 /// coverage of the reader's 150ms and writer's default three-second budgets.
 const DB_POOL_ACQUIRE_DURATION_BUCKETS_S: [f64; 9] =
     [0.001, 0.005, 0.01, 0.025, 0.05, 0.15, 0.5, 1.0, 3.0];
+const DB_POOL_ACQUIRE_DURATION_UNIT: metrics::Unit = metrics::Unit::Seconds;
 
 /// Seconds-scale buckets for Git hydration and pack streams.
 const GIT_DURATION_BUCKETS_S: [f64; 13] = [
@@ -197,7 +198,7 @@ pub(crate) fn describe_readiness_metrics() {
 pub(crate) fn describe_db_pool_metrics() {
     metrics::describe_histogram!(
         "buzz_db_pool_acquire_duration_seconds",
-        metrics::Unit::Seconds,
+        DB_POOL_ACQUIRE_DURATION_UNIT,
         "Database pool checkout duration by valid pool role and operation"
     );
     metrics::describe_counter!(
@@ -333,17 +334,28 @@ mod contract_tests {
         assert!(scrape.contains("# TYPE buzz_db_pool_acquire_attempts_total counter"));
         assert!(scrape.contains("# TYPE buzz_db_pool_waiters gauge"));
         assert!(scrape.contains("# HELP buzz_db_pool_acquire_duration_seconds Database pool checkout duration by valid pool role and operation"));
-        for bucket in ["0.001", "0.15", "3", "+Inf"] {
-            assert!(
-                scrape.lines().any(|line| {
-                    line.starts_with("buzz_db_pool_acquire_duration_seconds_bucket{")
-                        && line.contains("pool_role=\"writer\"")
-                        && line.contains("operation=\"readiness\"")
-                        && line.contains(&format!("le=\"{bucket}\""))
-                }),
-                "missing bucket {bucket} in scrape:\n{scrape}"
-            );
-        }
+        assert!(scrape.contains("# HELP buzz_db_pool_acquire_attempts_total Database pool checkout terminals by valid pool role, operation, and outcome"));
+        assert!(scrape.contains("# HELP buzz_db_pool_waiters Current database pool checkout waiters by valid pool role and operation"));
+        assert_eq!(super::DB_POOL_ACQUIRE_DURATION_UNIT, metrics::Unit::Seconds);
+        let readiness_buckets = scrape
+            .lines()
+            .filter(|line| {
+                line.starts_with("buzz_db_pool_acquire_duration_seconds_bucket{")
+                    && line.contains("pool_role=\"writer\"")
+                    && line.contains("operation=\"readiness\"")
+            })
+            .map(|line| {
+                line.split(",le=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split_once('"').map(|(bucket, _)| bucket))
+                    .expect("duration bucket carries le label")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            readiness_buckets,
+            ["0.001", "0.005", "0.01", "0.025", "0.05", "0.15", "0.5", "1", "3", "+Inf",],
+            "duration bucket contract drifted:\n{scrape}"
+        );
 
         let raw_series = scrape
             .lines()

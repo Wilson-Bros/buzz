@@ -696,8 +696,11 @@ impl Db {
         read_pool: PgPool,
         aurora_identity: std::sync::Arc<std::sync::OnceLock<bool>>,
     ) {
-        match observability::acquire_reader(&read_pool, observability::ReaderOperation::Bootstrap)
-            .await
+        match observability::acquire_reader_with_legacy_metrics(
+            &read_pool,
+            observability::ReaderOperation::Bootstrap,
+        )
+        .await
         {
             Ok(mut conn) => {
                 tracing::info!("read replica reachable at boot");
@@ -858,7 +861,9 @@ impl Db {
         // `read_pool` separately would spend a second budget whenever the
         // capability is uncached — i.e. after a failed boot ping, which is
         // precisely the reader-unavailable case the bound must hold for.
-        let conn = match observability::acquire_reader(read_pool, operation).await {
+        let conn = match observability::acquire_reader_with_legacy_metrics(read_pool, operation)
+            .await
+        {
             Ok(conn) => conn,
             Err(sqlx::Error::PoolTimedOut) => {
                 tracing::warn!("reader pool acquire timed out; routing to writer");
@@ -1082,9 +1087,11 @@ impl Db {
     pub async fn begin_event_write_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        let connection =
-            observability::acquire_writer(&self.pool, observability::WriterOperation::EventWrite)
-                .await?;
+        let connection = observability::acquire_writer_with_legacy_metrics(
+            &self.pool,
+            observability::WriterOperation::EventWrite,
+        )
+        .await?;
         sqlx::Transaction::begin(connection, None)
             .await
             .map_err(Into::into)
