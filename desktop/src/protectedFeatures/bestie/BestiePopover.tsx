@@ -10,13 +10,10 @@ import {
   useToggleReactionMutation,
 } from "@/features/messages/hooks";
 import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
-import {
-  hasSameMessageAuthor,
-  isWithinGroupingWindow,
-  startsNewMessageGroup,
-} from "@/features/messages/lib/messageGrouping";
+import { buildMainTimelineEntries } from "@/features/messages/lib/threadPanel";
+import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import type { TimelineMessage } from "@/features/messages/types";
-import { MessageRow } from "@/features/messages/ui/MessageRow";
+import { TimelineMessageList } from "@/features/messages/ui/TimelineMessageList";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { useProfileQuery } from "@/features/profile/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
@@ -31,6 +28,7 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
 import { Textarea } from "@/shared/ui/textarea";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { buildBestieMessageContext } from "./bestieMessageContext";
 import { useBestie } from "./useBestie";
 
 export function BestieTriggerVisual({
@@ -149,6 +147,16 @@ function BestieConversationTranscript({
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
   const latestMessageKey = messages.at(-1)?.renderKey ?? messages.at(-1)?.id;
+  const mainTimelineEntries = React.useMemo(
+    () => buildMainTimelineEntries(messages, undefined, undefined, profiles),
+    [messages, profiles],
+  );
+  useRenderScopedReactionHydration({
+    activeChannel: channel,
+    mainTimelineEntries,
+    threadHeadMessage: null,
+    threadMessages: [],
+  });
 
   React.useLayoutEffect(() => {
     if (!latestMessageKey) return;
@@ -166,41 +174,28 @@ function BestieConversationTranscript({
       data-testid="bestie-mini-transcript"
       ref={transcriptRef}
     >
-      {messages.map((message, index) => {
-        const previousMessage = messages[index - 1];
-        const isContinuation = Boolean(
-          previousMessage &&
-            !startsNewMessageGroup(message) &&
-            hasSameMessageAuthor(previousMessage, message) &&
-            isWithinGroupingWindow(
-              previousMessage.createdAt,
-              message.createdAt,
-            ),
-        );
-        return (
-          <MessageRow
-            actionBarPlacement="inside"
-            channelId={channel.id}
-            currentPubkey={currentPubkey}
-            isContinuation={isContinuation}
-            key={message.renderKey ?? message.id}
-            message={message}
-            onToggleReaction={onToggleReaction}
-            profiles={profiles}
-            showDepthGuides={false}
-          />
-        );
-      })}
+      <TimelineMessageList
+        channelId={channel.id}
+        channelName={channel.name}
+        channelType={channel.channelType}
+        currentPubkey={currentPubkey}
+        mainEntries={mainTimelineEntries}
+        messages={messages}
+        onToggleReaction={onToggleReaction}
+        profiles={profiles}
+      />
     </div>
   );
 }
 
 export function BestiePopover({
   avatarLayoutId,
+  contextChannelId,
   contextMessage,
   onRequestClose,
 }: {
   avatarLayoutId?: string;
+  contextChannelId?: string | null;
   contextMessage?: TimelineMessage;
   onRequestClose?: () => void;
 }) {
@@ -286,11 +281,8 @@ export function BestiePopover({
     currentPubkey,
   ]);
   const contextEnvelope = React.useMemo(
-    () =>
-      contextMessage
-        ? `Help me with this message from ${contextMessage.author}:\n\n> ${contextMessage.body.replaceAll("\n", "\n> ")}`
-        : null,
-    [contextMessage],
+    () => buildBestieMessageContext(contextChannelId, contextMessage),
+    [contextChannelId, contextMessage],
   );
   const conversationMessages = React.useMemo(() => {
     if (!conversationChannel) return [];

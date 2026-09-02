@@ -6,6 +6,7 @@ import { BestiePopover, BestieTriggerVisual } from "./BestiePopover";
 import { useBestie } from "./useBestie";
 
 export function BestieMessageAction({
+  channelId,
   message,
 }: {
   channelId?: string | null;
@@ -34,6 +35,7 @@ export function BestieMessageAction({
       </Tooltip>
       <PopoverContent align="end" className="w-80" side="top" sideOffset={10}>
         <BestiePopover
+          contextChannelId={channelId}
           contextMessage={message}
           onRequestClose={() => setOpen(false)}
         />
