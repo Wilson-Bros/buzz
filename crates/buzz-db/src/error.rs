@@ -13,10 +13,6 @@ pub enum DbError {
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
 
-    /// A database operation exceeded the absolute deadline owned by its caller.
-    #[error("database operation exceeded its deadline")]
-    DeadlineExceeded,
-
     /// Attempted to store an AUTH event (kind 22242), which is forbidden.
     #[error("AUTH events (kind 22242) must not be stored")]
     AuthEventRejected,

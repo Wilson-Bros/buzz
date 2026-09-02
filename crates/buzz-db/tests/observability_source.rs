@@ -180,6 +180,19 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(side_effects.contains("query_events_for_bootstrap"));
     assert!(side_effects.contains(".list_channels_for_bootstrap("));
 
+    let deletion = include_str!("../src/store/deletion.rs");
+    let public_serving_catalog = deletion
+        .split_once("pub async fn validate_serving_catalog(&self)")
+        .expect("deletion store must preserve its public serving-catalog API")
+        .1
+        .split_once("async fn validate_serving_catalog_on")
+        .expect("public serving-catalog validation must delegate to its connection helper")
+        .0;
+    assert!(public_serving_catalog.contains("WriterOperation::Bootstrap"));
+    assert!(public_serving_catalog.contains("observability::acquire_writer("));
+    assert!(public_serving_catalog.contains("validate_serving_catalog_on"));
+    assert!(!public_serving_catalog.contains("self.pool.acquire()"));
+
     let thread = include_str!("../src/store/thread.rs");
     let thread_metadata = thread
         .split_once("pub async fn get_thread_metadata_by_event(")

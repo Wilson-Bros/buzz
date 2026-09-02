@@ -207,7 +207,7 @@ pub(crate) fn describe_db_pool_metrics() {
     );
     metrics::describe_gauge!(
         "buzz_db_pool_waiters",
-        "Current database pool checkout waiters by valid pool role and operation"
+        "Current tracked-operation database pool checkout attempts in progress by valid pool role and operation"
     );
 }
 
@@ -335,7 +335,7 @@ mod contract_tests {
         assert!(scrape.contains("# TYPE buzz_db_pool_waiters gauge"));
         assert!(scrape.contains("# HELP buzz_db_pool_acquire_duration_seconds Database pool checkout duration by valid pool role and operation"));
         assert!(scrape.contains("# HELP buzz_db_pool_acquire_attempts_total Database pool checkout terminals by valid pool role, operation, and outcome"));
-        assert!(scrape.contains("# HELP buzz_db_pool_waiters Current database pool checkout waiters by valid pool role and operation"));
+        assert!(scrape.contains("# HELP buzz_db_pool_waiters Current tracked-operation database pool checkout attempts in progress by valid pool role and operation"));
         assert_eq!(super::DB_POOL_ACQUIRE_DURATION_UNIT, metrics::Unit::Seconds);
         let readiness_buckets = scrape
             .lines()

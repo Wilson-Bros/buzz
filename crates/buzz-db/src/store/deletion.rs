@@ -647,17 +647,12 @@ impl Db {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
-        let mut connection = match crate::observability::acquire_writer_until(
+        let mut connection = crate::observability::acquire_writer_until(
             &self.pool,
             crate::observability::WriterOperation::Readiness,
             deadline,
         )
-        .await
-        {
-            Ok(connection) => connection,
-            Err(sqlx::Error::PoolTimedOut) => return Err(DbError::DeadlineExceeded),
-            Err(error) => return Err(error.into()),
-        };
+        .await?;
         match tokio::time::timeout_at(
             deadline,
             self.deletion_store()
@@ -665,7 +660,7 @@ impl Db {
         )
         .await
         {
-            Err(_) => Err(DbError::DeadlineExceeded),
+            Err(_) => Err(sqlx::Error::PoolTimedOut.into()),
             Ok(result) => result,
         }
     }
@@ -820,7 +815,11 @@ impl DeletionStore {
 
     /// Validate the deletion catalog contract required by relay serving.
     pub async fn validate_serving_catalog(&self) -> Result<()> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::Bootstrap,
+        )
+        .await?;
         self.validate_serving_catalog_on(&mut connection).await
     }
 

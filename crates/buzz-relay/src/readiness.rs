@@ -335,7 +335,7 @@ async fn deletion_catalog_check(db: &Db, deadline: Instant) -> DeletionCatalogOu
 
 fn classify_deletion_catalog_result(result: buzz_db::Result<()>) -> DeletionCatalogOutcome {
     match result {
-        Err(DbError::DeadlineExceeded) => DeletionCatalogOutcome::OperationTimeout,
+        Err(DbError::Sqlx(sqlx::Error::PoolTimedOut)) => DeletionCatalogOutcome::OperationTimeout,
         Err(error) => {
             tracing::debug!(error = %error, "Deletion catalog readiness validation failed");
             DeletionCatalogOutcome::OperationError
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn deletion_catalog_deadline_is_a_timeout_not_an_operation_error() {
         assert_eq!(
-            classify_deletion_catalog_result(Err(DbError::DeadlineExceeded)),
+            classify_deletion_catalog_result(Err(DbError::Sqlx(sqlx::Error::PoolTimedOut))),
             DeletionCatalogOutcome::OperationTimeout
         );
         assert_eq!(

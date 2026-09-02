@@ -96,6 +96,21 @@ async fn begin_transaction_compatibility_alias_is_preserved() {
     assert_eq!(counters, expected);
 }
 
+#[test]
+fn nip43_reconciliation_compatibility_alias_is_preserved() {
+    #[allow(deprecated)]
+    async fn call(
+        db: &Db,
+        community_id: CommunityId,
+        relay_pubkey: &nostr::PublicKey,
+    ) -> crate::Result<bool> {
+        db.nip43_membership_snapshot_needs_reconciliation(community_id, relay_pubkey)
+            .await
+    }
+
+    let _ = call;
+}
+
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn readiness_check_distinguishes_pool_exhaustion_from_success() {

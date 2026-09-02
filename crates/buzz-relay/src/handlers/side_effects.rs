@@ -3059,8 +3059,18 @@ pub enum Nip43ReconciliationPurpose {
     Maintenance,
 }
 
+/// Preserve the original maintenance reconciliation API for downstream callers.
+#[deprecated(note = "use reconcile_nip43_membership_snapshots_with_purpose")]
+pub async fn reconcile_nip43_membership_snapshots(state: &Arc<AppState>) -> anyhow::Result<usize> {
+    reconcile_nip43_membership_snapshots_with_purpose(
+        state,
+        Nip43ReconciliationPurpose::Maintenance,
+    )
+    .await
+}
+
 /// Reconcile NIP-43 snapshots with explicit startup or maintenance attribution.
-pub async fn reconcile_nip43_membership_snapshots(
+pub async fn reconcile_nip43_membership_snapshots_with_purpose(
     state: &Arc<AppState>,
     purpose: Nip43ReconciliationPurpose,
 ) -> anyhow::Result<usize> {
@@ -3735,6 +3745,16 @@ pub async fn publish_nipia_unarchived(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nip43_reconciliation_compatibility_alias_is_preserved() {
+        #[allow(deprecated)]
+        async fn call(state: &Arc<AppState>) -> anyhow::Result<usize> {
+            reconcile_nip43_membership_snapshots(state).await
+        }
+
+        let _ = call;
+    }
 
     #[test]
     fn group_members_snapshot_keeps_members_past_one_thousand() {

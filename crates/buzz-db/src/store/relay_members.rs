@@ -854,6 +854,27 @@ impl Db {
         name = "nip43_membership_snapshot_needs_reconciliation",
         system = "postgresql"
     )]
+    #[deprecated(
+        note = "use nip43_membership_snapshot_needs_reconciliation_for_bootstrap or nip43_membership_snapshot_needs_reconciliation_for_maintenance"
+    )]
+    pub async fn nip43_membership_snapshot_needs_reconciliation(
+        &self,
+        community_id: CommunityId,
+        relay_pubkey: &nostr::PublicKey,
+    ) -> Result<bool> {
+        self.nip43_membership_snapshot_needs_reconciliation_with_operation(
+            community_id,
+            relay_pubkey,
+            observability::WriterOperation::Maintenance,
+        )
+        .await
+    }
+
+    /// Startup-attributed variant of the NIP-43 snapshot comparison.
+    #[datastore_span(
+        name = "nip43_membership_snapshot_needs_reconciliation_for_bootstrap",
+        system = "postgresql"
+    )]
     pub async fn nip43_membership_snapshot_needs_reconciliation_for_bootstrap(
         &self,
         community_id: CommunityId,
@@ -868,6 +889,10 @@ impl Db {
     }
 
     /// Periodic maintenance variant of the NIP-43 snapshot comparison.
+    #[datastore_span(
+        name = "nip43_membership_snapshot_needs_reconciliation_for_maintenance",
+        system = "postgresql"
+    )]
     pub async fn nip43_membership_snapshot_needs_reconciliation_for_maintenance(
         &self,
         community_id: CommunityId,

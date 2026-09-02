@@ -1297,7 +1297,10 @@ mod tests {
             )
             .await
             .expect_err("saturated deletion catalog checkout must time out");
-        assert!(matches!(timeout, crate::DbError::DeadlineExceeded));
+        assert!(matches!(
+            timeout,
+            crate::DbError::Sqlx(sqlx::Error::PoolTimedOut)
+        ));
         drop(held);
         db.validate_deletion_serving_catalog_for_readiness(
             tokio::time::Instant::now() + Duration::from_secs(2),

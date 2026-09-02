@@ -563,7 +563,7 @@ async fn main() -> anyhow::Result<()> {
     // this repairs pre-snapshot communities and any publication that failed
     // after a membership transaction committed.
     if config.require_relay_membership {
-        match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots(
+        match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots_with_purpose(
             &state,
             buzz_relay::handlers::side_effects::Nip43ReconciliationPurpose::Bootstrap,
         )
@@ -586,7 +586,7 @@ async fn main() -> anyhow::Result<()> {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots(
+                match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots_with_purpose(
                     &reconcile_state,
                     buzz_relay::handlers::side_effects::Nip43ReconciliationPurpose::Maintenance,
                 )

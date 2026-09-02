@@ -143,11 +143,17 @@ how completed/abandoned attempts ended, and how long checkout waits took.
 Outcome remains on the terminal counter for historical deployment comparison;
 it is intentionally absent from the expensive duration histogram.
 
+These families cover the explicitly routed deployment-critical operations
+listed below; they are not a count of every SQLx checkout in Buzz. In
+particular, a zero operation waiter does not prove that the shared SQLx pool
+has no uninstrumented waiter. Interpret it beside the pool active, idle, and
+maximum gauges when diagnosing total capacity pressure.
+
 | Metric | Type | Labels |
 |--------|------|--------|
 | `buzz_db_pool_acquire_duration_seconds` | histogram | `pool_role`, `operation` |
 | `buzz_db_pool_acquire_attempts_total` | counter | `pool_role`, `operation`, `outcome` |
-| `buzz_db_pool_waiters` | gauge | `pool_role`, `operation`; periodically refreshed including zero |
+| `buzz_db_pool_waiters` | gauge | `pool_role`, `operation`; tracked operations only, periodically refreshed including zero |
 
 Outcomes are `success`, `timeout`, `error`, and `cancelled`. Operations are
 `bootstrap`, `readiness`, `tenant_resolution`, `authentication`,
