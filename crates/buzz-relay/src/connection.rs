@@ -150,15 +150,21 @@ impl ConnectionState {
 /// `upstream_authority_deadline()` already includes the key-snapshot hard
 /// deadline (one of the three authority_deadlines terms), so this two-term min
 /// covers all four normative terms. Equality at any deadline is expired.
+///
+/// `connection_time` must be captured at or immediately before the WebSocket
+/// upgrade — not after the NIP-42 exchange — so the partition is rooted at the
+/// true connection establishment instant and the session cannot outlive
+/// `connection_time + max_connection_lifetime` by the authentication interval.
 pub(crate) fn compute_session_deadline(
     assertion: &buzz_auth::VerifiedAssertion,
+    connection_time: chrono::DateTime<chrono::Utc>,
     max_connection_lifetime: Option<std::time::Duration>,
 ) -> chrono::DateTime<chrono::Utc> {
     let upstream = assertion.upstream_authority_deadline();
     match max_connection_lifetime {
         Some(lifetime) => {
             let partition = match chrono::Duration::from_std(lifetime) {
-                Ok(d) => chrono::Utc::now() + d,
+                Ok(d) => connection_time + d,
                 // lifetime so large it overflows chrono — treat as effectively
                 // infinite, so the upstream deadline wins.
                 Err(_) => chrono::DateTime::<chrono::Utc>::MAX_UTC,
@@ -218,6 +224,9 @@ async fn handle_active_connection(
 ) {
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
+    // Capture connection_time before any await so the session partition is
+    // rooted at the true establishment instant. [FI-TRACE-LEASE-BOUND]
+    let connection_time = chrono::Utc::now();
     let permit = match state.conn_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -252,9 +261,13 @@ async fn handle_active_connection(
     // Equality at any deadline is expired. `upstream_authority_deadline()` already
     // includes the key-snapshot hard deadline (one of the three authority_deadlines
     // terms), so this min covers all normative terms.
-    let session_deadline = nip_fi_assertion
-        .as_ref()
-        .map(|a| compute_session_deadline(a, state.config.nip_fi.max_connection_lifetime()));
+    let session_deadline = nip_fi_assertion.as_ref().map(|a| {
+        compute_session_deadline(
+            a,
+            connection_time,
+            state.config.nip_fi.max_connection_lifetime(),
+        )
+    });
 
     let conn = Arc::new(ConnectionState {
         conn_id,
@@ -356,43 +369,9 @@ async fn handle_active_connection(
     // `authorization_denied` on `ctrl_tx` (priority channel, ahead of the Close
     // the send loop emits on cancel), then cancels. No in-band renewal.
     // [FI-TRACE-LEASE-BOUND]
-    let nip_fi_expiry_conn = Arc::clone(&conn);
-    let nip_fi_expiry_cancel = cancel.clone();
-    let nip_fi_expiry_task = conn.session_deadline.map(|deadline| {
-        tokio::spawn(async move {
-            let now = chrono::Utc::now();
-            // Equality at deadline is expired: use strict less-than to compute
-            // remaining duration. If already expired or equality holds, fire immediately.
-            let remaining = if now < deadline {
-                (deadline - now)
-                    .to_std()
-                    .unwrap_or(std::time::Duration::ZERO)
-            } else {
-                std::time::Duration::ZERO
-            };
-            tokio::select! {
-                _ = tokio::time::sleep(remaining) => {
-                    use buzz_auth::DenialClass;
-                    let msg = DenialClass::AuthorizationDenied.nostr_text();
-                    // Queue on ctrl_tx BEFORE cancel so the send loop's
-                    // cancellation branch drains it ahead of the Close frame.
-                    // Mirror the pairing-mismatch path in auth.rs. A full or
-                    // closed control channel is terminal — treat as already
-                    // disconnected and proceed to cancel regardless.
-                    let _ = nip_fi_expiry_conn.ctrl_tx.try_send(WsMessage::Text(
-                        crate::protocol::RelayMessage::notice(msg).into(),
-                    ));
-                    metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
-                    warn!(
-                        conn_id = %nip_fi_expiry_conn.conn_id,
-                        "NIP-FI session lease expired — closing connection"
-                    );
-                    nip_fi_expiry_cancel.cancel();
-                }
-                _ = nip_fi_expiry_cancel.cancelled() => {}
-            }
-        })
-    });
+    let nip_fi_expiry_task = conn
+        .session_deadline
+        .map(|deadline| spawn_nip_fi_expiry_task(Arc::clone(&conn), cancel.clone(), deadline));
 
     recv_loop(
         ws_recv,
@@ -444,7 +423,55 @@ async fn handle_active_connection(
     drop(permit);
 }
 
-/// Outbound send loop with control-frame priority.
+/// Spawn the NIP-FI session-lifetime enforcement task.
+///
+/// Fires at `deadline`, queues `restricted: authorization denied` on `conn.ctrl_tx`
+/// (priority channel, ahead of the Close the send loop emits on cancel), then
+/// cancels. No in-band renewal. [FI-TRACE-LEASE-BOUND]
+///
+/// Both the production path and tests call this constructor — mutations to the
+/// production expiry body redden the tests, mutations to the test cannot hide
+/// the production behavior.
+pub(crate) fn spawn_nip_fi_expiry_task(
+    conn: Arc<ConnectionState>,
+    cancel: CancellationToken,
+    deadline: chrono::DateTime<chrono::Utc>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let now = chrono::Utc::now();
+        // Equality at deadline is expired: use strict less-than to compute
+        // remaining duration. If already expired or equality holds, fire immediately.
+        let remaining = if now < deadline {
+            (deadline - now)
+                .to_std()
+                .unwrap_or(std::time::Duration::ZERO)
+        } else {
+            std::time::Duration::ZERO
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(remaining) => {
+                use buzz_auth::DenialClass;
+                let msg = DenialClass::AuthorizationDenied.nostr_text();
+                // Queue on ctrl_tx BEFORE cancel so the send loop's
+                // cancellation branch drains it ahead of the Close frame.
+                // Mirror the pairing-mismatch path in auth.rs. A full or
+                // closed control channel is terminal — treat as already
+                // disconnected and proceed to cancel regardless.
+                let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                    crate::protocol::RelayMessage::notice(msg).into(),
+                ));
+                metrics::counter!("buzz_nip_fi_lease_expirations_total").increment(1);
+                warn!(
+                    conn_id = %conn.conn_id,
+                    "NIP-FI session lease expired — closing connection"
+                );
+                cancel.cancel();
+            }
+            _ = cancel.cancelled() => {}
+        }
+    })
+}
+
 ///
 /// Control frames (Pong, Close) are drained first on every iteration,
 /// giving them priority over data frames. If the underlying socket writer
@@ -1281,7 +1308,7 @@ pub(crate) mod tests {
         // authority_deadlines = [exp, iat_max_age, key_hard] → min = exp
         let assertion = VerifiedAssertion::for_test(None, vec![exp, iat_max_age, key_hard]);
         let lifetime = std::time::Duration::from_secs(400);
-        let deadline = compute_session_deadline(&assertion, Some(lifetime));
+        let deadline = compute_session_deadline(&assertion, now, Some(lifetime));
         // exp < key_hard < lifetime; upstream = exp, partition >> exp → exp wins.
         assert_eq!(deadline, exp, "exp is earliest upstream term");
     }
@@ -1299,7 +1326,7 @@ pub(crate) mod tests {
         // lifetime partition = now + 100s < key_hard → partition wins.
         let assertion = VerifiedAssertion::for_test(None, vec![exp, iat_max_age, key_hard]);
         let lifetime = std::time::Duration::from_secs(100);
-        let deadline = compute_session_deadline(&assertion, Some(lifetime));
+        let deadline = compute_session_deadline(&assertion, now, Some(lifetime));
         // partition (now+100s) < upstream (now+200s) → partition wins.
         let expected_partition = now + Duration::seconds(100);
         // Allow 1s of wall-clock slack in the test.
@@ -1320,7 +1347,7 @@ pub(crate) mod tests {
         let exp = now + Duration::seconds(600);
         let key_hard = now + Duration::seconds(3600);
         let assertion = VerifiedAssertion::for_test(None, vec![exp, key_hard]);
-        let deadline = compute_session_deadline(&assertion, None);
+        let deadline = compute_session_deadline(&assertion, now, None);
         assert_eq!(deadline, exp, "no lifetime → upstream (exp) only");
     }
 
@@ -1328,12 +1355,16 @@ pub(crate) mod tests {
     //
     // The expiry task queues `restricted: authorization denied` on `ctrl_tx`
     // BEFORE cancellation, mirroring the pairing-mismatch path. This test
-    // drives the expiry task through the production code path: an already-expired
-    // deadline fires immediately; the ctrl channel carries the notice; the cancel
-    // fires afterward.
+    // invokes the production `spawn_nip_fi_expiry_task` constructor: an
+    // already-expired deadline fires immediately; the ctrl channel carries the
+    // notice; the cancel fires afterward.
     //
-    // Mutation: replacing `ctrl_tx.try_send` with `send_tx` turns this red
-    // (the notice would go to `send_rx` not `ctrl_rx`).
+    // Mutation evidence:
+    //   A) Replace `ctrl_tx.try_send` with `send_tx.try_send` in
+    //      `spawn_nip_fi_expiry_task` → `ctrl_rx.try_recv()` returns `Err`,
+    //      test panics at "ctrl channel must contain the notice frame".
+    //   B) Delete the `cancel.cancel()` call → `cancel.is_cancelled()` is
+    //      false, test panics at "expiry task must cancel the connection".
 
     #[tokio::test]
     async fn expiry_notice_queued_on_ctrl_before_cancel() {
@@ -1363,31 +1394,9 @@ pub(crate) mod tests {
             session_deadline: Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
         });
 
-        // Spawn the expiry task (mirrors the production spawn in handle_active_connection).
-        let expiry_conn = Arc::clone(&conn);
-        let expiry_cancel = cancel.clone();
+        // Invoke the production task constructor — not a copy of its body.
         let deadline = conn.session_deadline.unwrap();
-        let expiry_task = tokio::spawn(async move {
-            let now = chrono::Utc::now();
-            let remaining = if now < deadline {
-                (deadline - now)
-                    .to_std()
-                    .unwrap_or(std::time::Duration::ZERO)
-            } else {
-                std::time::Duration::ZERO
-            };
-            tokio::select! {
-                _ = tokio::time::sleep(remaining) => {
-                    use buzz_auth::DenialClass;
-                    let msg = DenialClass::AuthorizationDenied.nostr_text();
-                    let _ = expiry_conn.ctrl_tx.try_send(WsMessage::Text(
-                        crate::protocol::RelayMessage::notice(msg).into(),
-                    ));
-                    expiry_cancel.cancel();
-                }
-                _ = expiry_cancel.cancelled() => {}
-            }
-        });
+        let expiry_task = spawn_nip_fi_expiry_task(Arc::clone(&conn), cancel.clone(), deadline);
 
         tokio::time::timeout(std::time::Duration::from_secs(2), expiry_task)
             .await
@@ -1403,9 +1412,10 @@ pub(crate) mod tests {
                 // NOTICE serialises as ["NOTICE", <message>] — index position 1.
                 let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
                 let payload = v.get(1).and_then(|c| c.as_str()).unwrap_or("");
-                assert!(
-                    payload.contains("authorization denied"),
-                    "ctrl frame must carry the exact authorization_denied text; got: {payload}"
+                assert_eq!(
+                    payload,
+                    buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
+                    "ctrl frame must carry the exact authorization_denied text"
                 );
             }
             other => panic!("ctrl frame must be Text, got {other:?}"),

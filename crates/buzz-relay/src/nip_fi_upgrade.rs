@@ -299,27 +299,60 @@ mod tests {
         // (key mismatch, claimless assertion, expired lease) must map to
         // `AuthorizationDenied` with byte-identical HTTP responses.
         //
-        // This test drives two DISTINCT private-state conditions through
-        // `denial_response` and asserts their HTTP output is byte-identical.
-        // Mutation: mapping one cause to a different DenialClass turns this red.
+        // This test drives two DISTINCT private-state conditions through the
+        // production pairing function and `denial_response`, asserting that both
+        // produce byte-identical 403 `authorization denied\n` bodies.
         //
-        // Cause A: key mismatch → AuthorizationDenied
-        // Cause B: claimless assertion (asserted_key = None) → AuthorizationDenied
-        // Both must produce byte-identical 403 `authorization denied\n` bodies.
-        let resp_key_mismatch = denial_response(DenialClass::AuthorizationDenied);
-        let resp_claimless = denial_response(DenialClass::AuthorizationDenied);
-        // Same class → same bytes; but the point is that BOTH private conditions
-        // must resolve to AuthorizationDenied before reaching this call. The
-        // test below proves distinctness: we also verify that EvidenceRejected
-        // (a different, public denial) produces different bytes.
-        assert_eq!(resp_key_mismatch.status(), resp_claimless.status());
+        // Mutation evidence:
+        //   A) Map key-mismatch to a different DenialClass → `resp_key_mismatch`
+        //      status or body differs → assert_eq panics.
+        //   B) Map claimless to Ok(_) → `check_nip_fi_key_pairing(claimless, any)`
+        //      returns Ok → the `Err` arm is unreachable and this test would panic
+        //      at the unwrap.
+        use buzz_auth::VerifiedAssertion;
+        use chrono::{Duration, Utc};
+        use nostr::Keys;
+
+        // Condition A: key mismatch (asserted ≠ proven).
+        let asserted_keys = Keys::generate();
+        let proven_keys = Keys::generate();
+        let assertion_mismatch = VerifiedAssertion::for_test(
+            Some(asserted_keys.public_key()),
+            vec![Utc::now() + Duration::hours(1)],
+        );
+        let denial_a = crate::handlers::auth::check_nip_fi_key_pairing(
+            Some(&assertion_mismatch),
+            proven_keys.public_key(),
+        )
+        .unwrap_err(); // key mismatch must return Err
+
+        // Condition B: claimless assertion (asserted_key = None).
+        let assertion_claimless =
+            VerifiedAssertion::for_test(None, vec![Utc::now() + Duration::hours(1)]);
+        let denial_b = crate::handlers::auth::check_nip_fi_key_pairing(
+            Some(&assertion_claimless),
+            proven_keys.public_key(),
+        )
+        .unwrap_err(); // claimless must return Err
+
+        // Both distinct conditions must map to the same denial class.
         assert_eq!(
-            body_bytes(resp_key_mismatch),
-            body_bytes(resp_claimless),
-            "private-state rows must be byte-identical [FI-TRACE-DENIAL-ORACLE]"
+            denial_a, denial_b,
+            "key-mismatch and claimless must produce the same denial class"
         );
 
-        // Distinctness: public-evidence denial produces different bytes from private-state.
+        // Their HTTP responses must be byte-identical.
+        let resp_a = denial_response(denial_a);
+        let resp_b = denial_response(denial_b);
+        assert_eq!(resp_a.status(), resp_b.status());
+        assert_eq!(
+            body_bytes(resp_a),
+            body_bytes(resp_b),
+            "private-state rows must produce byte-identical HTTP bodies [FI-TRACE-DENIAL-ORACLE]"
+        );
+
+        // Distinctness: public-evidence denial (EvidenceRejected) produces
+        // different bytes from private-state denial (AuthorizationDenied).
         let resp_evidence = denial_response(DenialClass::EvidenceRejected);
         let resp_private = denial_response(DenialClass::AuthorizationDenied);
         assert_ne!(
@@ -333,15 +366,14 @@ mod tests {
     //
     // `check_nip_fi_at_upgrade` is the single pre-101 gate called by BOTH the
     // root relay handler and the huddle audio handler (C1). Tests here drive it
-    // with the exact request shapes that must deny and admit. A test that invokes
-    // the built router directly would be better — added for both ingresses in
-    // integration tests. These unit tests establish the mutation boundary:
+    // with the exact request shapes that must deny and admit, establishing the
+    // per-function mutation boundary.
     //
-    // Mutation (delete the gate call from either handler): the deny branch is
-    // unreachable from that path and the tests below — which call the gate
-    // function directly — would stay green, exposing the gap. These unit tests
-    // are paired with the router-level integration tests in router.rs which
-    // exercise the full WS upgrade path through the built router.
+    // Note: these unit tests call `check_nip_fi_at_upgrade` directly and do NOT
+    // falsify that the gate is wired into the router. The built-router integration
+    // tests in `router.rs` (`nip_fi_enforce_*`) exercise the full WS upgrade
+    // path through the real router for both `/` and `/huddle/{id}/audio` —
+    // deleting either production gate call turns those tests red.
     //
     // Enforce + no verifier → 503 (dependency fail-closed; startup race)
     #[test]

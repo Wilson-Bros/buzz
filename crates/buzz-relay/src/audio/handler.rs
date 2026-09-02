@@ -18,7 +18,7 @@ use std::time::Duration;
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{FromRequest, Path, State, WebSocketUpgrade},
     response::IntoResponse,
 };
 use bytes::Bytes;
@@ -65,8 +65,23 @@ pub async fn ws_audio_handler(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<Uuid>,
     headers: HeaderMap,
-    ws: WebSocketUpgrade,
+    req: axum::extract::Request,
 ) -> impl IntoResponse {
+    // NIP-FI assertion check at upgrade — before tenant lookup and before the
+    // WebSocket handshake. Running pre-lookup means a denied request pays zero
+    // DB cost and the gate is reachable in tests without a live community.
+    // [FI-TRACE-TRANSPORT-CLOSED] [NIP-FI.md §Admission pairing sequence]
+    let nip_fi_assertion = {
+        use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
+        let mode = state.config.nip_fi.mode;
+        let verifier = state.nip_fi_verifier.as_deref();
+        match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+            NipFiUpgradeOutcome::NotRequired => None,
+            NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
+            NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
+        }
+    };
+
     // Row zero: bind this huddle-audio connection to its community from the
     // request host BEFORE the WebSocket upgrade, identical to the main relay
     // door. An unmapped host or lookup failure fails closed with a generic 404
@@ -87,18 +102,9 @@ pub async fn ws_audio_handler(
         }
     };
 
-    // NIP-FI assertion check at upgrade — every authenticated WebSocket ingress
-    // (including huddle audio) must pass through the same pre-101 gate.
-    // [FI-TRACE-TRANSPORT-CLOSED] [NIP-FI.md §Admission pairing sequence]
-    let nip_fi_assertion = {
-        use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
-        let mode = state.config.nip_fi.mode;
-        let verifier = state.nip_fi_verifier.as_deref();
-        match check_nip_fi_at_upgrade(&headers, verifier, mode) {
-            NipFiUpgradeOutcome::NotRequired => None,
-            NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
-            NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
-        }
+    let ws = match WebSocketUpgrade::from_request(req, &state).await {
+        Ok(ws) => ws,
+        Err(e) => return e.into_response(),
     };
 
     let permit = match acquire_audio_connection_permit(&state.conn_semaphore) {
@@ -199,6 +205,9 @@ async fn handle_active_audio_connection(
 ) {
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
+    // Capture connection_time before any await so the session partition is
+    // rooted at the true upgrade instant, not post-NIP-42 auth. [FI-TRACE-LEASE-BOUND]
+    let connection_time = chrono::Utc::now();
     let (mut ws_send, mut ws_recv) = socket.split();
 
     let challenge = generate_challenge();
@@ -270,65 +279,41 @@ async fn handle_active_audio_connection(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
     let parent_channel_id = auth_msg.parent_channel_id;
 
-    // NIP-FI key pairing [FI-INV-05]: unconditional — identical to the main
-    // relay auth handler. When an assertion was presented at upgrade, the
-    // proven NIP-42 key MUST equal the assertion's `nostr_pubkey` claim.
-    // A None asserted_key (claimless assertion) is also a denial — defense in
-    // depth against assertions that omit the required claim.
+    // NIP-FI key pairing [FI-INV-05]: unconditional, using the shared production
+    // function. When an assertion was presented at upgrade, the proven NIP-42
+    // key MUST equal the assertion's `nostr_pubkey` claim. Claimless assertion
+    // is also a denial.
     // [FI-TRACE-DENIAL-ORACLE post-establishment]
-    if let Some(ref assertion) = nip_fi_assertion {
-        match assertion.asserted_key() {
-            Some(asserted_key) if asserted_key == pubkey => {
-                // Keys match — proceed.
-            }
-            Some(asserted_key) => {
-                warn!(
-                    channel_id = %channel_id,
-                    proven_pubkey = %pubkey.to_hex(),
-                    asserted_pubkey = %asserted_key.to_hex(),
-                    "NIP-FI audio key pairing mismatch — closing connection"
-                );
-                use buzz_auth::DenialClass;
-                let _ = ws_send
-                    .send(WsMessage::Text(
-                        serde_json::json!({
-                            "type": "restricted",
-                            "message": DenialClass::AuthorizationDenied.nostr_text()
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await;
-                return;
-            }
-            None => {
-                // Claimless assertion — no nostr_pubkey in token. Deny per spec.
-                warn!(
-                    channel_id = %channel_id,
-                    pubkey = %pubkey.to_hex(),
-                    "NIP-FI audio assertion has no nostr_pubkey claim — closing connection"
-                );
-                use buzz_auth::DenialClass;
-                let _ = ws_send
-                    .send(WsMessage::Text(
-                        serde_json::json!({
-                            "type": "restricted",
-                            "message": DenialClass::AuthorizationDenied.nostr_text()
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await;
-                return;
-            }
-        }
+    if let Err(_) =
+        crate::handlers::auth::check_nip_fi_key_pairing(nip_fi_assertion.as_ref(), pubkey)
+    {
+        warn!(
+            channel_id = %channel_id,
+            proven_pubkey = %pubkey.to_hex(),
+            asserted_pubkey = ?nip_fi_assertion.as_ref().and_then(|a| a.asserted_key()).map(|k| k.to_hex()),
+            "NIP-FI audio key pairing mismatch — closing connection"
+        );
+        use buzz_auth::DenialClass;
+        let _ = ws_send
+            .send(WsMessage::Text(
+                serde_json::json!({
+                    "type": "restricted",
+                    "message": DenialClass::AuthorizationDenied.nostr_text()
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        return;
     }
 
     // Compute the NIP-FI session deadline (same three-term formula as main relay).
+    // Partition is rooted at `connection_time` captured before NIP-42 auth.
     // [FI-TRACE-LEASE-BOUND]
     let audio_session_deadline = nip_fi_assertion.as_ref().map(|a| {
         crate::connection::compute_session_deadline(
             a,
+            connection_time,
             state.config.nip_fi.max_connection_lifetime(),
         )
     });
@@ -1291,6 +1276,17 @@ async fn send_loop<S>(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                // Drain queued control frames before closing — mirrors the root
+                // relay send_loop idiom. The NIP-FI expiry task queues the
+                // `restricted: authorization denied` frame on ctrl_tx BEFORE
+                // cancelling; without this drain the biased branch sends Close
+                // first and the client never sees the required denial frame.
+                // (The top-of-loop drain does not run again after we break.)
+                while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
+                    if ws_send.send(ctrl_msg).await.is_err() {
+                        return;
+                    }
+                }
                 let close = disconnect_reason
                     .borrow()
                     .map_or(WsMessage::Close(None), |reason| reason.close_message());

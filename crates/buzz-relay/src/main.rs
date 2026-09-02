@@ -507,11 +507,16 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Background refresh loop: owned, cancellable, with bounded exponential
-        // backoff for cold-start failures and normal cadence after first success.
-        // A panic inside the task kills only the task; the relay continues to
-        // deny with 503 rather than crashing. The process cancels the token on
-        // shutdown, which terminates the loop cleanly.
+        // Background refresh loop: per-issuer cold/backoff state; supervised so
+        // an unexpected panic restarts rather than silently disabling refresh.
+        // A panic kills only the inner task; the supervisor restarts it with
+        // backoff, keeping the relay alive (denying with 503) while recovering.
+        // The outer cancellation token terminates the supervisor cleanly.
+        //
+        // Ceiling formula: 300 seconds, regardless of base_interval.
+        // `(v * 2).min(300)` correctly caps the cold-start backoff at 300s.
+        // (The prior `.min(base_interval_secs.max(300))` allowed the ceiling
+        // above 300 when base_interval exceeded it.)
         let refresh_source = Arc::clone(&jwks_source);
         let refresh_cancel = jwks_refresh_cancel.clone();
         let base_interval_secs = jwks_configs
@@ -520,48 +525,83 @@ async fn main() -> anyhow::Result<()> {
             .min()
             .unwrap_or(300);
         jwks_refresh_handle = Some(tokio::spawn(async move {
-            // Bounded exponential backoff for cold-start: 5s → 10s → 20s → … → base_interval.
-            let mut backoff_secs: u64 = 5;
-            let mut any_success = false;
-
+            // Supervisor: restart the inner worker if it exits unexpectedly.
+            // Clean cancellation (token fired) terminates both the inner task
+            // and this supervisor.
+            let mut supervisor_backoff_secs: u64 = 1;
             loop {
-                let sleep_secs = if any_success {
-                    // Normal cadence once at least one snapshot is live.
-                    base_interval_secs
-                } else {
-                    backoff_secs
-                };
+                // Per-issuer cold state: each issuer tracks its own backoff
+                // independently so a healthy issuer never parks a cold one.
+                let mut per_issuer_backoff: Vec<(String, u64, bool)> = jwks_configs
+                    .iter()
+                    .map(|c| (c.issuer.clone(), 5u64, false))
+                    .collect();
+                let inner_source = Arc::clone(&refresh_source);
+                let inner_cancel = refresh_cancel.clone();
+                let inner_base = base_interval_secs;
+                let inner_task = tokio::spawn(async move {
+                    loop {
+                        // Compute sleep as the min across all per-issuer next-fire
+                        // times. An issuer that is warmed uses normal cadence;
+                        // a cold issuer uses its own backoff.
+                        let sleep_secs = per_issuer_backoff
+                            .iter()
+                            .map(|(_, backoff, warmed)| if *warmed { inner_base } else { *backoff })
+                            .min()
+                            .unwrap_or(inner_base);
 
-                tokio::select! {
-                    biased;
-                    _ = refresh_cancel.cancelled() => {
-                        tracing::debug!("NIP-FI: JWKS refresh loop cancelled");
+                        tokio::select! {
+                            biased;
+                            _ = inner_cancel.cancelled() => {
+                                tracing::debug!("NIP-FI: JWKS refresh loop cancelled");
+                                return;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
+                        }
+
+                        for (issuer, backoff, warmed) in &mut per_issuer_backoff {
+                            match inner_source.get_snapshot(issuer).await {
+                                Some(_) => {
+                                    tracing::debug!(issuer = %issuer, "NIP-FI: JWKS snapshot refreshed");
+                                    *warmed = true;
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        issuer = %issuer,
+                                        "NIP-FI: JWKS refresh failed — will retry"
+                                    );
+                                    if !*warmed {
+                                        // Cold-start backoff: double, capped at 300s.
+                                        *backoff = (*backoff * 2).min(300);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                match inner_task.await {
+                    Ok(()) => {
+                        // Clean return — cancellation fired; supervisor exits too.
                         return;
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
-                }
-
-                let mut tick_success = false;
-                for cfg in &jwks_configs {
-                    match refresh_source.get_snapshot(&cfg.issuer).await {
-                        Some(_) => {
-                            tracing::debug!(issuer = %cfg.issuer, "NIP-FI: JWKS snapshot refreshed");
-                            tick_success = true;
+                    Err(join_err) => {
+                        // Unexpected exit (panic or abort). Log, back off, restart.
+                        tracing::error!(
+                            error = %join_err,
+                            retry_secs = supervisor_backoff_secs,
+                            "NIP-FI: JWKS refresh worker exited unexpectedly — restarting"
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = refresh_cancel.cancelled() => return,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(
+                                supervisor_backoff_secs,
+                            )) => {}
                         }
-                        None => {
-                            tracing::warn!(
-                                issuer = %cfg.issuer,
-                                "NIP-FI: JWKS refresh failed — will retry"
-                            );
-                        }
+                        // Supervisor backoff: 1s → 2s → 4s → … → 60s ceiling.
+                        supervisor_backoff_secs = (supervisor_backoff_secs * 2).min(60);
                     }
-                }
-
-                if tick_success {
-                    any_success = true;
-                } else if !any_success {
-                    // Still in cold-start backoff: double with a 300s ceiling.
-                    backoff_secs = (backoff_secs * 2).min(base_interval_secs.max(300));
                 }
             }
         }));
@@ -1542,7 +1582,9 @@ async fn serve(
         // Cancel and join the JWKS refresh task so it doesn't outlive the process.
         jwks_refresh_cancel.cancel();
         if let Some(h) = jwks_refresh_handle {
-            let _ = h.await;
+            if let Err(e) = h.await {
+                tracing::warn!(error = %e, "NIP-FI: JWKS refresh supervisor join error on shutdown");
+            }
         }
         return Ok(());
     }
@@ -1571,7 +1613,9 @@ async fn serve(
     // Cancel and join the JWKS refresh task so it doesn't outlive the process.
     jwks_refresh_cancel.cancel();
     if let Some(h) = jwks_refresh_handle {
-        let _ = h.await;
+        if let Err(e) = h.await {
+            tracing::warn!(error = %e, "NIP-FI: JWKS refresh supervisor join error on shutdown");
+        }
     }
     Ok(())
 }

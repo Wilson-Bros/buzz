@@ -334,6 +334,21 @@ async fn nip11_or_ws_handler(
         return Json(nip11_document(&state, raw_host).await).into_response();
     }
 
+    // NIP-FI assertion check at upgrade — before tenant lookup and before the
+    // WebSocket handshake. Running pre-lookup means a denied request pays zero
+    // DB cost and the gate is reachable in tests without a live community.
+    // [FI-TRACE-TRANSPORT-CLOSED]
+    let nip_fi_assertion = {
+        use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
+        let mode = state.config.nip_fi.mode;
+        let verifier = state.nip_fi_verifier.as_deref();
+        match check_nip_fi_at_upgrade(&headers, verifier, mode) {
+            NipFiUpgradeOutcome::NotRequired => None,
+            NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
+            NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
+        }
+    };
+
     // Row zero: bind the connection to its community from the request host
     // BEFORE the WebSocket upgrade, so no frame is ever read on an unbound
     // connection. The host is the authoritative selector; an unmapped host or a
@@ -356,20 +371,6 @@ async fn nip11_or_ws_handler(
     };
 
     let max_frame_bytes = state.config.max_frame_bytes;
-
-    // NIP-FI assertion check at upgrade — before the WebSocket handshake, so
-    // a denied request gets an HTTP response, not a WebSocket close.
-    // [FI-TRACE-TRANSPORT-CLOSED]
-    let nip_fi_assertion = {
-        use crate::nip_fi_upgrade::{check_nip_fi_at_upgrade, NipFiUpgradeOutcome};
-        let mode = state.config.nip_fi.mode;
-        let verifier = state.nip_fi_verifier.as_deref();
-        match check_nip_fi_at_upgrade(&headers, verifier, mode) {
-            NipFiUpgradeOutcome::NotRequired => None,
-            NipFiUpgradeOutcome::Admitted(assertion) => Some(assertion),
-            NipFiUpgradeOutcome::Denied(resp) => return resp.into_response(),
-        }
-    };
 
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => {
@@ -1391,6 +1392,180 @@ mod tests {
         assert!(
             !handler_receives_message_with_limit(limit, limit + 1).await,
             "oversized messages must be rejected by the WebSocket parser before the handler sees them"
+        );
+    }
+
+    // ── NIP-FI built-router gate: both WS ingresses ───────────────────────────
+    //
+    // Drive the REAL built router (via tower `oneshot`) for both the root `/`
+    // and the huddle audio `/huddle/{id}/audio` WebSocket ingresses in NIP-FI
+    // enforce mode. These tests prove that both gate call sites live in
+    // production: deleting either gate call (at the top of `nip11_or_ws_handler`
+    // in `router.rs` or at the top of `ws_audio_handler` in `audio/handler.rs`)
+    // causes the request to proceed past the pre-101 check and receive a
+    // 404 (tenant not found) instead of the expected denial, turning these
+    // tests red.
+    //
+    // Mutation evidence:
+    //   A) Delete the gate call in `nip11_or_ws_handler` → root request
+    //      returns 404 (no community) instead of 401/503 → assert_eq panics.
+    //   B) Delete the gate call in `ws_audio_handler` → audio request returns
+    //      404 (no community) instead of 401/503 → assert_eq panics.
+    //   C) Switch `Enforce` to `Off` in the test state → both ingresses skip
+    //      the gate and return 404 (no community) → status assertions panic.
+
+    /// Build AppState with NIP-FI enforce mode and no verifier (simulates
+    /// startup with no JWKS yet warmed). The verifier is `None` because
+    /// `jwks_configs` is empty and `ProductionJwksSource::new` returns `None`
+    /// for an empty list; the mode field is set directly so no env is needed.
+    async fn nip_fi_enforce_state() -> Arc<AppState> {
+        use crate::nip_fi_config::NipFiRelayConfig;
+        use buzz_auth::{IssuerRegistry, NipFiMode};
+
+        // Clear NIP-FI env vars so `Config::from_env()` sees clean off-mode
+        // defaults; we overwrite the entire `nip_fi` field afterwards.
+        std::env::remove_var("BUZZ_NIP_FI_MODE");
+        std::env::remove_var("BUZZ_NIP_FI_ISSUERS");
+        std::env::remove_var("BUZZ_NIP_FI_MAX_ASSERTION_AGE_SECS");
+        std::env::remove_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS");
+
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        // Override NIP-FI mode to Enforce with no issuers configured — the
+        // verifier will be None (no JWKS source), which is the startup-race
+        // condition that must return 503 for a token-carrying request.
+        config.nip_fi = NipFiRelayConfig {
+            mode: NipFiMode::Enforce,
+            registry: IssuerRegistry::new(),
+            jwks_configs: vec![],
+            max_connection_lifetime_secs: 3600,
+        };
+
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    /// Drive a request through the real built router. Returns the HTTP status code.
+    /// For WebSocket upgrade paths, sends proper upgrade headers so axum's
+    /// WebSocketUpgrade extractor doesn't reject with 400 before the handler runs.
+    async fn nip_fi_gate_status(
+        state: Arc<AppState>,
+        path: &str,
+        extra_header_name: Option<&str>,
+        extra_header_value: Option<&str>,
+    ) -> axum::http::StatusCode {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut builder = Request::get(path)
+            .header(axum::http::header::HOST, "relay.example")
+            // WebSocket upgrade headers so axum's WebSocketUpgrade extractor
+            // doesn't reject with 400/426 before the handler body runs.
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if let (Some(name), Some(value)) = (extra_header_name, extra_header_value) {
+            builder = builder.header(name, value);
+        }
+        let req = builder.body(Body::empty()).expect("request");
+        build_router(state)
+            .oneshot(req)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn nip_fi_enforce_root_denies_missing_assertion_401() {
+        let state = nip_fi_enforce_state().await;
+        let status = nip_fi_gate_status(state, "/", None, None).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "root WebSocket upgrade without assertion must be denied 401 in enforce mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip_fi_enforce_audio_denies_missing_assertion_401() {
+        let state = nip_fi_enforce_state().await;
+        let channel_id = uuid::Uuid::new_v4();
+        let path = format!("/huddle/{channel_id}/audio");
+        let status = nip_fi_gate_status(state, &path, None, None).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "audio WebSocket upgrade without assertion must be denied 401 in enforce mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip_fi_enforce_root_denies_token_when_no_verifier_503() {
+        let state = nip_fi_enforce_state().await;
+        // A plausible but unverifiable bearer token on the correct header —
+        // verifier is None (no JWKS). Expect 503 authorization unavailable.
+        let status = nip_fi_gate_status(
+            state,
+            "/",
+            Some("Nostr-Federated-Identity"),
+            Some("Bearer eyJhbGciOiJFUzI1NiJ9.e30.sig"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "root WebSocket upgrade with token but no verifier must be denied 503 in enforce mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip_fi_enforce_audio_denies_token_when_no_verifier_503() {
+        let state = nip_fi_enforce_state().await;
+        let channel_id = uuid::Uuid::new_v4();
+        let path = format!("/huddle/{channel_id}/audio");
+        let status = nip_fi_gate_status(
+            state,
+            &path,
+            Some("Nostr-Federated-Identity"),
+            Some("Bearer eyJhbGciOiJFUzI1NiJ9.e30.sig"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "audio WebSocket upgrade with token but no verifier must be denied 503 in enforce mode"
         );
     }
 }
