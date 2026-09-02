@@ -86,6 +86,7 @@ type MessageRowItemProps = {
   searchActiveMessageId?: string | null;
   searchMatchingMessageIds?: Set<string>;
   searchQuery?: string;
+  showProtectedMessageAction?: boolean;
   threadUnreadCounts?: ReadonlyMap<string, number>;
   unfollowThreadById?: (rootId: string) => void;
   videoReviewContext: ReturnType<typeof buildVideoReviewContextForMessage>;
@@ -118,6 +119,7 @@ export function MessageRowItem({
   searchActiveMessageId,
   searchMatchingMessageIds,
   searchQuery,
+  showProtectedMessageAction,
   threadUnreadCounts,
   unfollowThreadById,
   videoReviewContext,
@@ -173,6 +175,7 @@ export function MessageRowItem({
               : undefined
           }
           profiles={profiles}
+          showProtectedMessageAction={showProtectedMessageAction}
           showDepthGuides={false}
           videoReviewContext={videoReviewContext}
         />
@@ -218,6 +221,7 @@ export function MessageRowItem({
         onToggleReaction={onToggleReaction}
         onReply={onReply}
         profiles={profiles}
+        showProtectedMessageAction={showProtectedMessageAction}
         searchQuery={isSearchMatch ? searchQuery : undefined}
         showDepthGuides={false}
         videoReviewContext={videoReviewContext}

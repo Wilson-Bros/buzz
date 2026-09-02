@@ -398,6 +398,7 @@ export const MessageActionBar = React.memo(function MessageActionBar({
   onUnfollowThread,
   reactionErrorMessage = null,
   reactions,
+  showProtectedMessageAction = true,
   isFollowingThread,
   isUnread,
 }: {
@@ -418,6 +419,7 @@ export const MessageActionBar = React.memo(function MessageActionBar({
   onUnfollowThread?: (message: TimelineMessage) => void;
   reactionErrorMessage?: string | null;
   reactions: TimelineReaction[];
+  showProtectedMessageAction?: boolean;
   isFollowingThread?: boolean;
   /** Current read state of the clicked message, from the same predicate the
    *  unread badge uses. Drives the single mark-read/unread toggle label. */
@@ -563,7 +565,9 @@ export const MessageActionBar = React.memo(function MessageActionBar({
             </Popover>
           ) : null}
 
-          <ProtectedMessageAction channelId={channelId} message={message} />
+          {showProtectedMessageAction ? (
+            <ProtectedMessageAction channelId={channelId} message={message} />
+          ) : null}
 
           {hasReactionAction && quickReactionItems.length > 0 ? (
             <div

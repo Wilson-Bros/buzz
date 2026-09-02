@@ -305,6 +305,16 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   );
   await expect(miniTranscript).toContainText("Here’s the concise reply.");
   await expect(sentMessageRow.getByLabel("Toggle 👀 reaction")).toBeVisible();
+  const miniDayDivider = miniTranscript
+    .getByTestId("message-timeline-day-divider")
+    .first();
+  if ((await miniDayDivider.count()) > 0) {
+    await expect(miniDayDivider).toHaveCSS("position", "static");
+  }
+  await sentMessageRow.hover();
+  await expect(
+    sentMessageRow.locator('[data-testid^="bestie-message-"]'),
+  ).toHaveCount(0);
 
   await miniComposer.fill("One more thought");
   await miniComposer.press("Enter");

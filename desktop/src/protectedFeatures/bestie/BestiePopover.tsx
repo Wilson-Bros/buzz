@@ -183,6 +183,8 @@ function BestieConversationTranscript({
         messages={messages}
         onToggleReaction={onToggleReaction}
         profiles={profiles}
+        showProtectedMessageAction={false}
+        stickyDayDividers={false}
       />
     </div>
   );
