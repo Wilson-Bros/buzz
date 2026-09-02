@@ -206,6 +206,10 @@ export function BestiePopover({
   const [contextSent, setContextSent] = React.useState(false);
   const [conversationChannel, setConversationChannel] =
     React.useState<Channel | null>(null);
+  const [sessionBoundary, setSessionBoundary] = React.useState<{
+    baselineMessageIds: ReadonlySet<string>;
+    firstMessageCreatedAt: number;
+  } | null>(null);
   const identityQuery = useIdentityQuery();
   const profileQuery = useProfileQuery();
   const conversationQuery = useChannelMessagesQuery(conversationChannel);
@@ -286,7 +290,7 @@ export function BestiePopover({
     () => buildBestieMessageContext(contextChannelId, contextMessage),
     [contextChannelId, contextMessage],
   );
-  const conversationMessages = React.useMemo(() => {
+  const allConversationMessages = React.useMemo(() => {
     if (!conversationChannel) return [];
     return formatTimelineMessages(
       conversationQuery.data ?? [],
@@ -310,8 +314,7 @@ export function BestiePopover({
           body: message.body.slice(contextEnvelope.length).trim(),
         };
       })
-      .filter((message) => message.body.length > 0)
-      .slice(-12);
+      .filter((message) => message.body.length > 0);
   }, [
     contextEnvelope,
     conversationChannel,
@@ -320,6 +323,16 @@ export function BestiePopover({
     currentProfile?.avatarUrl,
     currentPubkey,
   ]);
+  const conversationMessages = React.useMemo(() => {
+    if (!sessionBoundary) return [];
+    return allConversationMessages
+      .filter(
+        (message) =>
+          message.createdAt >= sessionBoundary.firstMessageCreatedAt &&
+          !sessionBoundary.baselineMessageIds.has(message.id),
+      )
+      .slice(-12);
+  }, [allConversationMessages, sessionBoundary]);
   const handleToggleReaction = React.useCallback(
     async (message: TimelineMessage, emoji: string, remove: boolean) => {
       await toggleReactionMutateRef.current({
@@ -340,6 +353,9 @@ export function BestiePopover({
     const trimmedDraft = draft.trim();
     if (!trimmedDraft || bestie.isOpening || sendMutation.isPending) return;
     void (async () => {
+      const baselineMessageIds = new Set(
+        allConversationMessages.map((message) => message.id),
+      );
       const startResult = bestie.ensureAgentRunning().then(
         () => ({ error: null }),
         (error: unknown) => ({ error }),
@@ -349,13 +365,20 @@ export function BestiePopover({
         (await (conversationPromiseRef.current ??
           bestie.resolveConversation()));
       setConversationChannel(channel);
-      await sendMutation.mutateAsync({
+      const sentMessage = await sendMutation.mutateAsync({
         content:
           contextEnvelope && !contextSent
             ? `${contextEnvelope}\n\n${trimmedDraft}`
             : trimmedDraft,
         targetChannel: channel,
       });
+      setSessionBoundary(
+        (current) =>
+          current ?? {
+            baselineMessageIds,
+            firstMessageCreatedAt: sentMessage.created_at,
+          },
+      );
       setContextSent(true);
       setDraft("");
       const { error: startError } = await startResult;

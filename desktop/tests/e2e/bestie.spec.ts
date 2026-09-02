@@ -338,4 +338,30 @@ test("assigns from an agent profile, reopens, drags, and offers the message acti
   });
   await messagePopover.getByRole("button", { name: "Close Bestie" }).click();
   await expect(page.getByLabel("Message Mochi")).toHaveCount(0);
+
+  await floatingAvatar.click();
+  const freshFloatingPopover = page.getByTestId("bestie-bloom-content");
+  await expect(freshFloatingPopover.getByLabel("Message Mochi")).toBeVisible();
+  await expect(
+    freshFloatingPopover.getByTestId("bestie-mini-transcript"),
+  ).toHaveCount(0);
+  await expect(freshFloatingPopover).not.toContainText("One more thought");
+  await freshFloatingPopover
+    .getByRole("button", { name: "Close Bestie" })
+    .click();
+
+  await messageRow.hover();
+  await messageAction.focus();
+  await messageAction.press("Enter");
+  const freshMessagePopover = page
+    .locator("[data-radix-popper-content-wrapper]")
+    .last();
+  await expect(freshMessagePopover.getByLabel("Message Mochi")).toBeVisible();
+  await expect(
+    freshMessagePopover.getByTestId("bestie-mini-transcript"),
+  ).toHaveCount(0);
+  await expect(freshMessagePopover).not.toContainText("One more thought");
+  await expect(
+    freshMessagePopover.getByTestId("bestie-message-snapshot"),
+  ).toBeVisible();
 });
