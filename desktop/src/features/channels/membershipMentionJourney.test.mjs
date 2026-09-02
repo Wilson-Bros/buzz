@@ -285,10 +285,7 @@ for (const [owner, role] of [
 ]) {
   test(`fresh create/add then first @ catches up without a manual directory refresh (${owner === VIEWER ? "owned" : "nonowned"}, ${role})`, async () => {
     await setup({ owner, role });
-    assert.equal(
-      rows().filter((row) => row.isAgent && !row.notInChannel).length,
-      0,
-    );
+    assert.equal(rows().filter((row) => row.action === "mention").length, 0);
     assert.equal(
       state.directoryCalls,
       1,
@@ -305,7 +302,7 @@ for (const [owner, role] of [
       "accepted add refreshes even while the roster lags",
     );
     assert.equal(
-      rows().filter((row) => row.isAgent && !row.notInChannel).length,
+      rows().filter((row) => row.action === "mention").length,
       0,
       "acceptance does not fabricate membership (owned preparation may offer Invite)",
     );
@@ -347,6 +344,36 @@ for (const [owner, role] of [
   });
 }
 
+for (const condition of ["denied", "missing", "failed"]) {
+  test(`membership alone never admits a ${condition} agent`, async () => {
+    await setup({ owner: OTHER });
+    state.visible = true;
+    state.directoryVisible = true;
+    state.policy = condition === "denied" ? "owner-only" : "anyone";
+    state.missingDirectory = condition === "missing";
+    state.failDirectory = condition === "failed";
+    await act(async () =>
+      mutations.add.mutateAsync({
+        pubkeys: [AGENT],
+        role: state.role,
+        channelId: CHANNEL,
+      }),
+    );
+    await settle();
+    assert.equal(mention.memberPubkeys.has(AGENT), true);
+    assert.equal(
+      rows().length,
+      1,
+      "an already visible member explains its disabled action",
+    );
+    assert.equal(
+      rows()[0].action,
+      condition === "missing" ? "checking" : "unavailable",
+    );
+    assert.equal(rows()[0].notInChannel, false);
+  });
+}
+
 test("an all-rejected add does not trigger a directory rebuild", async () => {
   await setup({
     addResult: { added: [], errors: [{ pubkey: AGENT, error: "denied" }] },
@@ -383,10 +410,7 @@ test("a cancelled late roster cannot trigger discovery or resurrect its member",
   await settle();
   assert.equal(state.directoryCalls, beforeCalls);
   assert.equal(mention.memberPubkeys.has(AGENT), false);
-  assert.equal(
-    rows().filter((row) => row.isAgent && !row.notInChannel).length,
-    0,
-  );
+  assert.equal(rows().filter((row) => row.action === "mention").length, 0);
 });
 
 for (const change of [
@@ -426,6 +450,11 @@ for (const change of [
       "old actionable row must not establish intent",
     );
     assert.deepEqual(mention.knownNames, []);
+    assert.equal(
+      mention.isAgentPubkey(AGENT),
+      true,
+      "directory removal never turns a known agent into a human",
+    );
   });
 }
 
@@ -456,7 +485,7 @@ test("retained explicit pin rejects latest policy denial without draft effects",
     client.invalidateQueries({ queryKey: ["relay-agents"] }),
   );
   await settle();
-  assert.equal(rows().length, 0);
+  assert.equal(rows()[0].action, "unavailable");
   await act(async () => oldPin(row));
   assert.deepEqual(effects, []);
   assert.deepEqual(mention.knownNames, []);
@@ -670,8 +699,8 @@ test("retained team cannot bind a removed exact member", async () => {
   );
   await settle();
   assert.equal(
-    mention.suggestions.some((s) => s.pubkey === AGENT),
-    false,
+    mention.suggestions.find((s) => s.pubkey === AGENT)?.action,
+    "checking",
   );
   assert.ok(mention.suggestions.find((s) => s.kind === "team"));
   let edit;
@@ -1038,3 +1067,32 @@ test("editing plain text refreshes an explicit menu before its next choice", asy
     );
   });
 });
+
+for (const condition of ["denied", "missing", "failed"]) {
+  test(`disabled ${condition} member rejects pointer, keyboard and new pin intent`, async () => {
+    await setup({
+      owner: OTHER,
+      visible: true,
+      directoryVisible: true,
+      policy: condition === "denied" ? "owner-only" : "anyone",
+      missingDirectory: condition === "missing",
+      failDirectory: condition === "failed",
+    });
+    const row = rows()[0];
+    assert.equal(mention.canSelectMention(row), false);
+    await act(async () => {
+      picker.selectMentionSuggestion(row);
+      picker.toggleAlwaysAddressAgent(row);
+      mention.handleMentionKeyDown(keyboard("ArrowDown"));
+    });
+    for (const key of ["Tab", "Enter", " "]) {
+      let outcome;
+      await act(async () => {
+        outcome = mention.handleMentionKeyDown(keyboard(key));
+      });
+      assert.equal(outcome.suggestion, undefined);
+    }
+    assert.deepEqual(effects, []);
+    assert.deepEqual(mention.knownNames, []);
+  });
+}

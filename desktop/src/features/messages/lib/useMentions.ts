@@ -2,6 +2,7 @@ import {
   isMentionActionable,
   markMentionCollisions,
 } from "./mentionPresentation";
+import { useMentionEvidence } from "./useMentionEvidence";
 import * as React from "react";
 import {
   useManagedAgentsQuery,
@@ -229,10 +230,6 @@ export function useMentions(
     }
     return lookup;
   }, [managedAgentsQuery.data, personasQuery.data]);
-  const knownAgentPubkeys = React.useMemo(
-    () => new Set([...mentionableAgentPubkeys, ...managedAgentPubkeys]),
-    [managedAgentPubkeys, mentionableAgentPubkeys],
-  );
   const activePersonas = React.useMemo(
     () => (personasQuery.data ?? []).filter((persona) => persona.isActive),
     [personasQuery.data],
@@ -259,10 +256,40 @@ export function useMentions(
       }),
     [managedAgentPubkeys, members, profiles, relayAgentsQuery.data],
   );
+  const retryDirectory = React.useCallback(() => {
+    void relayAgentsQuery.refetch();
+    void managedAgentsQuery.refetch();
+    void membersQuery.refetch();
+  }, [
+    relayAgentsQuery.refetch,
+    managedAgentsQuery.refetch,
+    membersQuery.refetch,
+  ]);
+  const {
+    knownAgentPubkeys,
+    verificationFailed,
+    presenceFresh,
+    retryVerification,
+  } = useMentionEvidence({
+    scope: `${currentPubkey}:${channelId}`,
+    open: mentionQuery !== null,
+    agentKeys: new Set([
+      ...agentIdentityPubkeys,
+      ...userSearchResults
+        .filter((user) => user.isAgent)
+        .map((user) => normalizePubkey(user.pubkey)),
+    ]),
+    directoryUpdatedAt: relayAgentsQuery.dataUpdatedAt,
+    directoryError: !!relayAgentsQuery.error || !!managedAgentsQuery.error,
+    retry: retryDirectory,
+  });
   const mentionCandidates = React.useMemo<MentionCandidate[]>(
     () =>
       buildMentionCandidates({
         activeAgentPubkeys,
+        knownAgentPubkeys,
+        verificationFailed,
+        presenceFresh,
         activePersonaById,
         activePersonas,
         canSearchGlobalUsers,
@@ -286,6 +313,9 @@ export function useMentions(
       }),
     [
       activePersonaById,
+      knownAgentPubkeys,
+      verificationFailed,
+      presenceFresh,
       activeAgentPubkeys,
       activePersonas,
       userSearchResults,
@@ -377,8 +407,8 @@ export function useMentions(
     )
       .slice(0, MENTION_SUGGESTION_LIMIT)
       .map(({ candidate, label }) =>
-        query.bind(
-          mapMentionCandidateToSuggestion({
+        query.bind({
+          ...mapMentionCandidateToSuggestion({
             agentProvenanceReady: agentDirectoriesReady,
             candidate,
             label,
@@ -387,11 +417,14 @@ export function useMentions(
             ownerProfiles: ownerProfilesQuery.data?.profiles,
             profiles,
           }),
-        ),
+          onRetry:
+            candidate.action === "unavailable" ? retryVerification : undefined,
+        }),
       );
   }, [
     activePersonaIds,
     agentDirectoriesReady,
+    retryVerification,
     currentPubkey,
     mentionCandidatesWithTeams,
     mentionQuery,
@@ -695,7 +728,7 @@ export function useMentions(
     () => selectedAgentMentionPubkeysRef.current,
   ).current;
   const revalidateMentionPubkeys = useAgentMentionRevalidation({
-    agentPubkeys: agentIdentityPubkeys,
+    agentPubkeys: knownAgentPubkeys,
     getSelectedAgentPubkeys,
     currentPubkey,
     eligibilityScope: mentionChannelId
